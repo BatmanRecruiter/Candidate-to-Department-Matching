@@ -2,8 +2,13 @@ services:
   - type: web
     name: candidate-dept-matching
     runtime: docker
+    healthCheckPath: /api/health
     envVars:
       - key: DATABASE_URL
         sync: false
+      - key: ADMIN_PASSCODE_HASH
+        sync: false
       - key: NODE_ENV
         value: production
+      - key: PORT
+        value: 10000

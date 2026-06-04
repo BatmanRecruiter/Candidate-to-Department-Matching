@@ -1,13 +1,3 @@
----
-title: Candidate to Department Matching
-emoji: 🎯
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # Candidate Department Matching
 
 Recruiter-operator tool that scores LinkedIn-style candidate CSVs against the
