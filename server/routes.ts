@@ -9,6 +9,7 @@ import { augmentRoleLibrary, type RoleLibraryJob } from "@shared/matcher";
 import { calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
 import { storage } from "./storage";
 import { runRoleSync, syncedRoleToLibraryJob } from "./role-sync";
+import { matchCandidateLLM } from "./matcher-llm";
 // Statically import the role library so esbuild bundles it into the
 // production server build. The dev server also reads the file from disk as a
 // fallback so regenerating the JSON without restarting works.
@@ -233,6 +234,19 @@ export async function registerRoutes(
     try {
       if (!requireAdmin(req, res)) return;
       res.json(await storage.listCalibrations());
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.post("/api/match", async (req, res, next) => {
+    try {
+      const { row } = req.body as { row: Record<string, string> };
+      if (!row || typeof row !== "object" || Array.isArray(row)) {
+        return res.status(400).json({ message: "row must be a plain object" });
+      }
+      const result = await matchCandidateLLM(row);
+      res.json(result);
     } catch (err) {
       next(err);
     }

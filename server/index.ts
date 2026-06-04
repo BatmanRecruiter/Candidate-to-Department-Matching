@@ -47,6 +47,16 @@ app.use(
     legacyHeaders: false,
   }),
 );
+// LLM match endpoint — each call hits the Anthropic API. 600/15 min = 40/min.
+app.use(
+  "/api/match",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+);
 
 declare module "http" {
   interface IncomingMessage {

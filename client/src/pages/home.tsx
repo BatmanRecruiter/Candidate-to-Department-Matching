@@ -42,7 +42,7 @@ import {
   buildExportHeaders,
   buildExportRow,
 } from "@/lib/export";
-import { matchCandidate, type MatchResult, type RoleLibraryJob } from "@shared/matcher";
+import type { MatchResult, RoleLibraryJob } from "@shared/matcher";
 import { APPENDED_COLUMNS, COLUMN_TEMPLATE } from "@shared/template";
 import type { CalibrationSummary, SavedFileSummary } from "@shared/schema";
 
@@ -226,8 +226,8 @@ export default function Home() {
           );
         }
         const exportHeaders = buildExportHeaders(headers);
-        const results = [];
-        const exportRows: string[][] = [];
+        const results: MatchResult[] = new Array(rows.length);
+        const exportRows: string[][] = new Array(rows.length);
         const runId =
           typeof crypto !== "undefined" && "randomUUID" in crypto
             ? crypto.randomUUID()
@@ -239,23 +239,26 @@ export default function Home() {
             ? latestCalibrationMap(await loadCalibrations(effectiveAdminPasscode))
             : new Map<string, CalibrationResponse>();
 
-        // Chunk processing so the UI can update progress without blocking.
-        const CHUNK = 50;
-        for (let i = 0; i < rows.length; i += CHUNK) {
-          const end = Math.min(i + CHUNK, rows.length);
-          for (let j = i; j < end; j++) {
-            const r = rows[j];
-            const baseMatch = matchCandidate(r, jobs);
-            const m = applyCalibrationResponse(
-              baseMatch,
-              calibrationMap.get(candidateKeyForRow(r)),
-            );
-            results.push(m);
-            exportRows.push(buildExportRow(r, m, headers));
-          }
-          setProgress(Math.round((end / rows.length) * 100));
-          // Yield to UI
-          await new Promise((res) => setTimeout(res, 0));
+        // Send candidates to the server-side LLM matcher in parallel batches.
+        let completed = 0;
+        const CONCURRENCY = 5;
+        for (let i = 0; i < rows.length; i += CONCURRENCY) {
+          const chunk = rows.slice(i, Math.min(i + CONCURRENCY, rows.length));
+          await Promise.all(
+            chunk.map(async (r, offset) => {
+              const idx = i + offset;
+              const matchRes = await apiRequest("POST", "/api/match", { row: r });
+              const baseMatch = (await matchRes.json()) as MatchResult;
+              const m = applyCalibrationResponse(
+                baseMatch,
+                calibrationMap.get(candidateKeyForRow(r)),
+              );
+              results[idx] = m;
+              exportRows[idx] = buildExportRow(r, m, headers);
+              completed++;
+              setProgress(Math.round((completed / rows.length) * 100));
+            }),
+          );
         }
 
         const exportCsv = rowsToCsv(exportHeaders, exportRows);
@@ -323,7 +326,7 @@ export default function Home() {
         setProcessing(false);
       }
     },
-    [adminPasscode, jobs, toast],
+    [adminPasscode, toast],
   );
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -436,7 +439,7 @@ export default function Home() {
                 phData Match
               </h1>
               <p className="text-xs text-white/70 font-mono">
-                candidate → department · recent-work weighted matching
+                candidate → department · LLM-powered matching
               </p>
             </div>
           </div>
@@ -776,7 +779,7 @@ export default function Home() {
                   drop a LinkedIn export CSV
                 </p>
                 <p className="text-xs text-muted-foreground mt-1 font-mono">
-                  template export columns · department evaluation columns appended · processed in browser
+                  template export columns · department evaluation columns appended · LLM-scored server-side
                 </p>
                 <input
                   id="csv-file"
@@ -902,8 +905,8 @@ export default function Home() {
               <CardContent>
                 <div className="grid sm:grid-cols-3 gap-3 text-sm">
                   {[
-                    ["Weight", "The matcher heavily prioritizes work from the past 3 years and discounts older buzzwords."],
-                    ["Route", "Candidates are routed to departments only; specific role fit is no longer exported."],
+                    ["Evaluate", "Claude reads the candidate's actual work history and what they do — not just tool keywords — to route them to the right department."],
+                    ["Route", "Candidates are routed to departments only; specific role fit is no longer exported. Calibration corrections are applied on top."],
                     ["Export", "Download the template-shaped file with department score, rationale, and department fit appended."],
                   ].map(([label, text]) => (
                     <div
