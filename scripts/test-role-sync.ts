@@ -2,21 +2,18 @@
  * Verify role-sync logic: normalization, dedupe by job_id, and that synced
  * roles are surfaced through the combined library used by the matcher.
  *
- * This test runs against a temporary SQLite file so it doesn't pollute the
- * real data.db. It mocks the Greenhouse fetch by stubbing global.fetch.
+ * Requires DATABASE_URL to point to a Neon (or Postgres) database.
+ * Tables are truncated before and after the run so it is safe against a
+ * dev/staging database — do NOT run against production.
  */
+import "dotenv/config";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-const TMP_DB = path.resolve(process.cwd(), `data.test-${Date.now()}.db`);
-// Point storage at a throwaway DB before importing it.
-process.chdir(process.cwd());
-process.env.DATABASE_PATH = TMP_DB;
-
-// better-sqlite3 reads the literal path "data.db" in server/storage.ts.
-// Easiest reliable approach: cd into a temp dir for the run, then load.
-const tmpDir = fs.mkdtempSync(path.join(process.cwd(), ".tmp-rolesync-"));
-process.chdir(tmpDir);
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL must be set to run this test");
+  process.exit(1);
+}
 
 let errors = 0;
 function assert(cond: any, msg: string) {
@@ -28,7 +25,16 @@ function assert(cond: any, msg: string) {
   }
 }
 
+async function truncateTables() {
+  const { db } = await import("../server/storage");
+  const { syncedRoles, syncRuns } = await import("../shared/schema");
+  await db.delete(syncedRoles);
+  await db.delete(syncRuns);
+}
+
 async function main() {
+  await truncateTables();
+
   // Stub fetch to return a fake Greenhouse response.
   const fakeJobs = [
     {
@@ -68,7 +74,6 @@ async function main() {
     },
   });
 
-  // Dynamic import AFTER cwd swap so storage picks up the temp dir.
   const { runRoleSync, syncedRoleToLibraryJob } = await import(
     "../server/role-sync"
   );
@@ -148,15 +153,7 @@ main()
     console.error(e);
     errors++;
   })
-  .finally(() => {
-    // Cleanup
-    try {
-      const here = process.cwd();
-      for (const f of fs.readdirSync(here)) {
-        if (f.startsWith("data.db")) fs.unlinkSync(path.join(here, f));
-      }
-      process.chdir(path.resolve(here, ".."));
-      fs.rmSync(here, { recursive: true, force: true });
-    } catch {}
+  .finally(async () => {
+    await truncateTables().catch(() => {});
     process.exit(errors === 0 ? 0 : 1);
   });

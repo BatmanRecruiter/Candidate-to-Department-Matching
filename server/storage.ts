@@ -9,89 +9,12 @@ import type {
   User,
   InsertUser,
 } from '@shared/schema';
-import { drizzle } from "drizzle-orm/better-sqlite3";
-import Database from "better-sqlite3";
+import { neon } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-http";
 import { count, desc, eq } from "drizzle-orm";
 
-const sqlite = new Database("data.db");
-sqlite.pragma("journal_mode = WAL");
-sqlite.exec(`
-  CREATE TABLE IF NOT EXISTS saved_files (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    history_key_hash TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    file_name TEXT NOT NULL,
-    row_count INTEGER NOT NULL,
-    column_count INTEGER NOT NULL,
-    byte_size INTEGER NOT NULL,
-    csv_text TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_saved_files_created_at ON saved_files(created_at);
-  CREATE INDEX IF NOT EXISTS idx_saved_files_run_id ON saved_files(run_id);
-
-  CREATE TABLE IF NOT EXISTS calibrations (
-    id TEXT PRIMARY KEY,
-    history_key_hash TEXT NOT NULL,
-    candidate_key TEXT NOT NULL,
-    candidate_name TEXT NOT NULL,
-    original_department TEXT NOT NULL,
-    original_role TEXT NOT NULL,
-    original_confidence INTEGER NOT NULL,
-    is_correct INTEGER NOT NULL,
-    corrected_department TEXT NOT NULL,
-    corrected_role TEXT NOT NULL,
-    feedback_reason TEXT NOT NULL,
-    created_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_calibrations_history_key_hash ON calibrations(history_key_hash);
-  CREATE INDEX IF NOT EXISTS idx_calibrations_candidate_key ON calibrations(candidate_key);
-  CREATE INDEX IF NOT EXISTS idx_calibrations_created_at ON calibrations(created_at);
-
-  CREATE TABLE IF NOT EXISTS synced_roles (
-    job_id TEXT PRIMARY KEY,
-    department TEXT NOT NULL,
-    title TEXT NOT NULL,
-    location TEXT NOT NULL,
-    url TEXT NOT NULL,
-    region TEXT NOT NULL,
-    seniority TEXT NOT NULL,
-    required_yoe INTEGER,
-    required_skills TEXT NOT NULL,
-    preferred_skills TEXT NOT NULL,
-    body TEXT NOT NULL,
-    search_text TEXT NOT NULL,
-    source TEXT NOT NULL,
-    is_active INTEGER NOT NULL DEFAULT 1,
-    first_seen_at INTEGER NOT NULL,
-    last_seen_at INTEGER NOT NULL
-  );
-  CREATE INDEX IF NOT EXISTS idx_synced_roles_active ON synced_roles(is_active);
-  CREATE INDEX IF NOT EXISTS idx_synced_roles_dept ON synced_roles(department);
-
-  CREATE TABLE IF NOT EXISTS sync_runs (
-    id TEXT PRIMARY KEY,
-    started_at INTEGER NOT NULL,
-    finished_at INTEGER NOT NULL,
-    status TEXT NOT NULL,
-    source TEXT NOT NULL,
-    roles_found INTEGER NOT NULL DEFAULT 0,
-    roles_new INTEGER NOT NULL DEFAULT 0,
-    roles_updated INTEGER NOT NULL DEFAULT 0,
-    roles_deactivated INTEGER NOT NULL DEFAULT 0,
-    error_message TEXT
-  );
-  CREATE INDEX IF NOT EXISTS idx_sync_runs_finished_at ON sync_runs(finished_at);
-`);
-try {
-  sqlite.exec("ALTER TABLE saved_files ADD COLUMN history_key_hash TEXT NOT NULL DEFAULT ''");
-} catch {
-  // Column already exists.
-}
-sqlite.exec("CREATE INDEX IF NOT EXISTS idx_saved_files_history_key_hash ON saved_files(history_key_hash)");
-
-export const db = drizzle(sqlite);
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle({ client: sql });
 
 export interface IStorage {
   getUser(id: number): Promise<User | undefined>;
@@ -113,15 +36,18 @@ export interface IStorage {
 
 export class DatabaseStorage implements IStorage {
   async getUser(id: number): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.id, id)).get();
+    const [row] = await db.select().from(users).where(eq(users.id, id));
+    return row;
   }
 
   async getUserByUsername(username: string): Promise<User | undefined> {
-    return db.select().from(users).where(eq(users.username, username)).get();
+    const [row] = await db.select().from(users).where(eq(users.username, username));
+    return row;
   }
 
   async createUser(insertUser: InsertUser): Promise<User> {
-    return db.insert(users).values(insertUser).returning().get();
+    const [row] = await db.insert(users).values(insertUser).returning();
+    return row;
   }
 
   async listSavedFiles(): Promise<SavedFileSummary[]> {
@@ -138,29 +64,22 @@ export class DatabaseStorage implements IStorage {
       })
       .from(savedFiles)
       .orderBy(desc(savedFiles.createdAt))
-      .limit(50)
-      .all();
+      .limit(50);
   }
 
   async getSavedFile(id: string): Promise<SavedFile | undefined> {
-    return db
-      .select()
-      .from(savedFiles)
-      .where(eq(savedFiles.id, id))
-      .get();
+    const [row] = await db.select().from(savedFiles).where(eq(savedFiles.id, id));
+    return row;
   }
 
   async createSavedFile(file: SavedFile): Promise<SavedFile> {
-    return db.insert(savedFiles).values(file).returning().get();
+    const [row] = await db.insert(savedFiles).values(file).returning();
+    return row;
   }
 
   async countSavedFiles(): Promise<number> {
-    return (
-      db
-        .select({ value: count() })
-        .from(savedFiles)
-        .get()?.value || 0
-    );
+    const [row] = await db.select({ value: count() }).from(savedFiles);
+    return row?.value ?? 0;
   }
 
   async listCalibrations(): Promise<CalibrationSummary[]> {
@@ -180,36 +99,34 @@ export class DatabaseStorage implements IStorage {
       })
       .from(calibrations)
       .orderBy(desc(calibrations.createdAt))
-      .limit(500)
-      .all();
+      .limit(500);
   }
 
   async createCalibration(calibration: Calibration): Promise<Calibration> {
-    return db.insert(calibrations).values(calibration).returning().get();
+    const [row] = await db.insert(calibrations).values(calibration).returning();
+    return row;
   }
 
   async countCalibrations(): Promise<number> {
-    return (
-      db
-        .select({ value: count() })
-        .from(calibrations)
-        .get()?.value || 0
-    );
+    const [row] = await db.select({ value: count() }).from(calibrations);
+    return row?.value ?? 0;
   }
 
   async listSyncedRoles(activeOnly = false): Promise<SyncedRole[]> {
-    const q = db.select().from(syncedRoles);
-    return activeOnly ? q.where(eq(syncedRoles.isActive, 1)).all() : q.all();
+    if (activeOnly) {
+      return db.select().from(syncedRoles).where(eq(syncedRoles.isActive, 1));
+    }
+    return db.select().from(syncedRoles);
   }
 
   async upsertSyncedRole(role: SyncedRole): Promise<{ inserted: boolean }> {
-    const existing = db
+    const [existing] = await db
       .select({ jobId: syncedRoles.jobId })
       .from(syncedRoles)
-      .where(eq(syncedRoles.jobId, role.jobId))
-      .get();
+      .where(eq(syncedRoles.jobId, role.jobId));
     if (existing) {
-      db.update(syncedRoles)
+      await db
+        .update(syncedRoles)
         .set({
           department: role.department,
           title: role.title,
@@ -226,11 +143,10 @@ export class DatabaseStorage implements IStorage {
           isActive: 1,
           lastSeenAt: role.lastSeenAt,
         })
-        .where(eq(syncedRoles.jobId, role.jobId))
-        .run();
+        .where(eq(syncedRoles.jobId, role.jobId));
       return { inserted: false };
     }
-    db.insert(syncedRoles).values(role).run();
+    await db.insert(syncedRoles).values(role);
     return { inserted: true };
   }
 
@@ -238,18 +154,17 @@ export class DatabaseStorage implements IStorage {
     activeIds: string[],
     now: number,
   ): Promise<number> {
-    const all = db
+    const all = await db
       .select({ jobId: syncedRoles.jobId, isActive: syncedRoles.isActive })
-      .from(syncedRoles)
-      .all();
+      .from(syncedRoles);
     const activeSet = new Set(activeIds);
     let deactivated = 0;
     for (const row of all) {
       if (!activeSet.has(row.jobId) && row.isActive === 1) {
-        db.update(syncedRoles)
-          .set({ isActive: 0, lastSeenAt: row.isActive === 1 ? now : now })
-          .where(eq(syncedRoles.jobId, row.jobId))
-          .run();
+        await db
+          .update(syncedRoles)
+          .set({ isActive: 0, lastSeenAt: now })
+          .where(eq(syncedRoles.jobId, row.jobId));
         deactivated++;
       }
     }
@@ -257,16 +172,17 @@ export class DatabaseStorage implements IStorage {
   }
 
   async recordSyncRun(run: SyncRun): Promise<SyncRun> {
-    return db.insert(syncRuns).values(run).returning().get();
+    const [row] = await db.insert(syncRuns).values(run).returning();
+    return row;
   }
 
   async latestSyncRun(): Promise<SyncRun | undefined> {
-    return db
+    const [row] = await db
       .select()
       .from(syncRuns)
       .orderBy(desc(syncRuns.finishedAt))
-      .limit(1)
-      .get();
+      .limit(1);
+    return row;
   }
 }
 

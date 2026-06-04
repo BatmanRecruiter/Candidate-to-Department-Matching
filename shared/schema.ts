@@ -1,10 +1,10 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { pgTable, text, integer, bigint } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
 // Template keeps users table to satisfy storage scaffolding; unused.
-export const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
+export const users = pgTable("users", {
+  id: integer("id").primaryKey().generatedAlwaysAsIdentity(),
   username: text("username").notNull().unique(),
   password: text("password").notNull(),
 });
@@ -17,20 +17,20 @@ export const insertUserSchema = createInsertSchema(users).pick({
 export type InsertUser = z.infer<typeof insertUserSchema>;
 export type User = typeof users.$inferSelect;
 
-export const savedFiles = sqliteTable("saved_files", {
+export const savedFiles = pgTable("saved_files", {
   id: text("id").primaryKey(),
   runId: text("run_id").notNull(),
   historyKeyHash: text("history_key_hash").notNull(),
-  kind: text("kind", { enum: ["upload", "export"] }).notNull(),
+  kind: text("kind").notNull(),
   fileName: text("file_name").notNull(),
   rowCount: integer("row_count").notNull(),
   columnCount: integer("column_count").notNull(),
   byteSize: integer("byte_size").notNull(),
   csvText: text("csv_text").notNull(),
-  createdAt: integer("created_at").notNull(),
+  createdAt: bigint("created_at", { mode: "number" }).notNull(),
 });
 
-export const syncedRoles = sqliteTable("synced_roles", {
+export const syncedRoles = pgTable("synced_roles", {
   jobId: text("job_id").primaryKey(),
   department: text("department").notNull(),
   title: text("title").notNull(),
@@ -45,15 +45,15 @@ export const syncedRoles = sqliteTable("synced_roles", {
   searchText: text("search_text").notNull(),
   source: text("source").notNull(), // "greenhouse" | "manual"
   isActive: integer("is_active").notNull().default(1),
-  firstSeenAt: integer("first_seen_at").notNull(),
-  lastSeenAt: integer("last_seen_at").notNull(),
+  firstSeenAt: bigint("first_seen_at", { mode: "number" }).notNull(),
+  lastSeenAt: bigint("last_seen_at", { mode: "number" }).notNull(),
 });
 
-export const syncRuns = sqliteTable("sync_runs", {
+export const syncRuns = pgTable("sync_runs", {
   id: text("id").primaryKey(),
-  startedAt: integer("started_at").notNull(),
-  finishedAt: integer("finished_at").notNull(),
-  status: text("status", { enum: ["success", "error", "partial"] }).notNull(),
+  startedAt: bigint("started_at", { mode: "number" }).notNull(),
+  finishedAt: bigint("finished_at", { mode: "number" }).notNull(),
+  status: text("status").notNull(),
   source: text("source").notNull(), // "manual" | "automated"
   rolesFound: integer("roles_found").notNull().default(0),
   rolesNew: integer("roles_new").notNull().default(0),
@@ -65,7 +65,7 @@ export const syncRuns = sqliteTable("sync_runs", {
 export type SyncedRole = typeof syncedRoles.$inferSelect;
 export type SyncRun = typeof syncRuns.$inferSelect;
 
-export const calibrations = sqliteTable("calibrations", {
+export const calibrations = pgTable("calibrations", {
   id: text("id").primaryKey(),
   historyKeyHash: text("history_key_hash").notNull(),
   candidateKey: text("candidate_key").notNull(),
@@ -77,7 +77,7 @@ export const calibrations = sqliteTable("calibrations", {
   correctedDepartment: text("corrected_department").notNull(),
   correctedRole: text("corrected_role").notNull(),
   feedbackReason: text("feedback_reason").notNull(),
-  createdAt: integer("created_at").notNull(),
+  createdAt: bigint("created_at", { mode: "number" }).notNull(),
 });
 
 export const insertSavedFileSchema = createInsertSchema(savedFiles).omit({

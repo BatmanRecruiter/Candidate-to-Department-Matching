@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: candidate-dept-matching
+    runtime: docker
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: NODE_ENV
+        value: production

@@ -8,9 +8,8 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-ENV PORT=7860
 ENV NODE_ENV=production
 
-EXPOSE 7860
+EXPOSE 10000
 
 CMD ["node", "dist/index.cjs"]
