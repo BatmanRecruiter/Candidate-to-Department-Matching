@@ -135,9 +135,8 @@ Return "Not a Match for phData" when the candidate's background is primarily:
 ---
 
 ## Confidence Levels
-3 — Very confident. Candidate's work clearly maps to one department. Multiple corroborating signals (title, company type, work descriptions, deliverables).
-2 — Confident. Department is clear but there is some ambiguity, mixed background, or one area of uncertainty.
-1 — Low confidence. Reasonable guess but profile is sparse, ambiguous, or candidate meaningfully bridges two departments.
+2 — Confident. Route this candidate. Their background clearly maps to the department with sufficient corroborating signals. A recruiter does not need to review.
+1 — Low confidence. A recruiter should review before acting. Use this when the profile is sparse, genuinely ambiguous, or the candidate meaningfully bridges two departments.
 "N/A" — Not a match for phData. Background is clearly outside phData's service areas.
 "?" — Cannot determine. Profile is blank, near-blank, or has genuinely no evaluatable professional signal.
 
@@ -145,7 +144,7 @@ Return "Not a Match for phData" when the candidate's background is primarily:
 
 CRITICAL OUTPUT FORMAT: Your ENTIRE response must be a single JSON object and NOTHING ELSE. No preamble, no reasoning, no markdown. Start with { and end with }.
 
-{"department": "<exact department name>", "confidence": <1, 2, 3, "N/A", or "?">, "rationale": "<2-3 sentences citing specific evidence from their profile>"}
+{"department": "<exact department name>", "confidence": <2, 1, "N/A", or "?">, "rationale": "<2-3 sentences citing specific evidence from their profile>"}
 
 Valid department values: "Data Engineering", "Analytics", "Machine Learning", "Advisory", "Business Architecture", "Managed Services", "PMO", "Sales", "Unsure / Not Enough Information", "Not a Match for phData", "Needs human review"`;
 }
@@ -200,8 +199,9 @@ function extractJson(text: string): string | null {
   return null;
 }
 
-function parseConfidence(raw: unknown): 1 | 2 | 3 | "N/A" | "?" {
-  if (raw === 3 || raw === "3") return 3;
+function parseConfidence(raw: unknown): 1 | 2 | "N/A" | "?" {
+  // 3 is folded into 2 (both are "confident — no review needed")
+  if (raw === 3 || raw === "3") return 2;
   if (raw === 2 || raw === "2") return 2;
   if (raw === 1 || raw === "1") return 1;
   if (raw === "N/A" || raw === null) return "N/A";

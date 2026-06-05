@@ -822,9 +822,8 @@ export default function Home() {
               <CardTitle className="text-sm">Confidence legend</CardTitle>
             </CardHeader>
             <CardContent className="space-y-2 text-xs">
-              <ConfidenceRow level={3} label="Very confident department fit" />
-              <ConfidenceRow level={2} label="Likely phData fit; department is obvious" />
-              <ConfidenceRow level={1} label="Likely phData fit; department needs review" />
+              <ConfidenceRow level={2} label="Confident — route without review" />
+              <ConfidenceRow level={1} label="Low confidence — recruiter should review" />
               <div className="flex items-center gap-2" data-testid="legend-confidence-na">
                 <span className="inline-flex h-5 min-w-8 items-center justify-center rounded bg-destructive/10 px-1 font-mono text-[11px] font-semibold text-destructive">
                   N/A
@@ -1105,13 +1104,12 @@ function ConfidenceRow({
   level,
   label,
 }: {
-  level: 1 | 2 | 3;
+  level: 1 | 2;
   label: string;
 }) {
   const colors = {
     1: "bg-muted text-muted-foreground",
-    2: "bg-chart-4/20 text-chart-4",
-    3: "bg-primary/20 text-primary",
+    2: "bg-primary/20 text-primary",
   } as const;
   return (
     <div className="flex items-center gap-2" data-testid={`legend-confidence-${level}`}>
@@ -1440,15 +1438,13 @@ function ResultsTable({
               const name = candidateDisplayName(r, i);
               const conf = m.confidence;
               const confClass =
-                conf === 3
+                conf === 2 || conf === 3
                   ? "bg-primary/20 text-primary"
-                  : conf === 2
-                    ? "bg-chart-4/20 text-chart-4"
-                    : conf === 1
-                      ? "bg-muted text-muted-foreground"
-                      : conf === "N/A"
-                        ? "bg-destructive/10 text-destructive"
-                        : "bg-muted text-muted-foreground";
+                  : conf === 1
+                    ? "bg-muted text-muted-foreground"
+                    : conf === "N/A"
+                      ? "bg-destructive/10 text-destructive"
+                      : "bg-muted text-muted-foreground";
               return (
                 <Fragment key={i}>
                   <tr
@@ -1490,7 +1486,7 @@ function ResultsTable({
                         className={`inline-flex h-5 min-w-5 items-center justify-center rounded px-1 font-mono text-[11px] font-semibold ${confClass}`}
                         data-testid={`result-confidence-${i}`}
                       >
-                        {conf}
+                        {conf === 3 ? 2 : conf}
                       </span>
                     </td>
                     <td
@@ -1630,19 +1626,17 @@ function ResultsTable({
                   </div>
                   <span
                     className={`inline-flex h-7 min-w-7 items-center justify-center rounded px-2 font-mono text-xs font-semibold ${
-                      reviewItem.match.confidence === 3
+                      reviewItem.match.confidence === 2 || reviewItem.match.confidence === 3
                         ? "bg-primary/20 text-primary"
-                        : reviewItem.match.confidence === 2
-                          ? "bg-chart-4/20 text-chart-4"
-                          : reviewItem.match.confidence === 1
-                            ? "bg-muted text-muted-foreground"
-                            : reviewItem.match.confidence === "N/A"
-                              ? "bg-destructive/10 text-destructive"
-                              : "bg-muted text-muted-foreground"
+                        : reviewItem.match.confidence === 1
+                          ? "bg-muted text-muted-foreground"
+                          : reviewItem.match.confidence === "N/A"
+                            ? "bg-destructive/10 text-destructive"
+                            : "bg-muted text-muted-foreground"
                     }`}
                     data-testid="text-review-confidence"
                   >
-                    {reviewItem.match.confidence}
+                    {reviewItem.match.confidence === 3 ? 2 : reviewItem.match.confidence}
                   </span>
                 </div>
                 {reviewItem.calibration && (
