@@ -196,6 +196,35 @@ export default function Home() {
     [calibrationsQ.data],
   );
 
+  const correctionCount = useMemo(
+    () => (calibrationsQ.data || []).filter((c) => c.isCorrect === 0).length,
+    [calibrationsQ.data],
+  );
+
+  const [analysisText, setAnalysisText] = useState<string | null>(null);
+  const [analysisRunning, setAnalysisRunning] = useState(false);
+
+  const onRunAnalysis = useCallback(async () => {
+    const passcode = adminPasscode.trim();
+    if (!passcode) return;
+    setAnalysisRunning(true);
+    setAnalysisText(null);
+    try {
+      const res = await apiRequest(
+        "GET",
+        "/api/calibrations/analysis?generate=true",
+        undefined,
+        { "x-admin-passcode": passcode },
+      );
+      const data = await res.json() as { correctionCount: number; analysis: string | null };
+      setAnalysisText(data.analysis ?? "No analysis returned.");
+    } catch {
+      toast({ title: "Analysis failed", description: "Could not generate calibration analysis.", variant: "destructive" });
+    } finally {
+      setAnalysisRunning(false);
+    }
+  }, [adminPasscode, toast]);
+
   const byDept = useMemo(() => {
     const m = new Map<string, RoleLibraryJob[]>();
     for (const j of jobs) {
@@ -607,6 +636,69 @@ export default function Home() {
                     <p className="text-[11px] text-destructive" data-testid="text-sync-error">
                       Error: {lastSyncResult.errorMessage}
                     </p>
+                  )}
+                </div>
+              )}
+              {adminPasscode.trim() && correctionCount > 0 && (
+                <div
+                  className={`space-y-2 rounded-md border p-2 ${
+                    correctionCount >= 50
+                      ? "border-amber-500/60 bg-amber-500/5"
+                      : "border-border/70 bg-background/60"
+                  }`}
+                  data-testid="card-calibration-intelligence"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold flex items-center gap-1.5">
+                      <SlidersHorizontal className="h-3.5 w-3.5" />
+                      Calibration intelligence
+                      {correctionCount >= 50 && (
+                        <span className="ml-1 rounded bg-amber-500/20 px-1.5 py-0.5 text-[10px] font-semibold text-amber-600">
+                          TIPPING POINT
+                        </span>
+                      )}
+                    </p>
+                    <Button
+                      size="sm"
+                      variant={correctionCount >= 50 ? "default" : "outline"}
+                      className="h-7 px-2 text-xs"
+                      onClick={onRunAnalysis}
+                      disabled={analysisRunning}
+                    >
+                      {analysisRunning ? (
+                        <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Sparkles className="mr-1 h-3.5 w-3.5" />
+                      )}
+                      {analysisRunning ? "Analyzing…" : "Run Analysis"}
+                    </Button>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 h-1.5 rounded-full bg-muted overflow-hidden">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          correctionCount >= 50 ? "bg-amber-500" : "bg-primary/60"
+                        }`}
+                        style={{ width: `${Math.min(100, (correctionCount / 50) * 100)}%` }}
+                      />
+                    </div>
+                    <span className="text-[11px] font-mono text-muted-foreground whitespace-nowrap">
+                      {correctionCount} / 50 corrections
+                    </span>
+                  </div>
+                  {correctionCount >= 50 && !analysisText && (
+                    <p className="text-[11px] text-amber-700 leading-relaxed">
+                      You have enough recruiter corrections to identify systemic misrouting patterns. Run the analysis to get specific prompt boundary update recommendations.
+                      {process.env.SLACK_WEBHOOK_URL !== undefined && " Results will also be sent to Slack."}
+                    </p>
+                  )}
+                  {analysisText && (
+                    <div className="rounded-md border border-border/60 bg-background p-2 space-y-1">
+                      <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+                        Analysis
+                      </p>
+                      <p className="text-xs leading-relaxed whitespace-pre-wrap">{analysisText}</p>
+                    </div>
                   )}
                 </div>
               )}

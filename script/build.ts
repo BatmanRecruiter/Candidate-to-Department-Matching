@@ -5,7 +5,7 @@ import { rm, readFile } from "node:fs/promises";
 // server deps to bundle to reduce openat(2) syscalls
 // which helps cold start times
 const allowlist = [
-  "@google/generative-ai",
+  "@anthropic-ai/sdk",
   "@neondatabase/serverless",
   "axios",
   "cors",
@@ -20,7 +20,6 @@ const allowlist = [
   "multer",
   "nanoid",
   "nodemailer",
-  "openai",
   "passport",
   "passport-local",
   "stripe",

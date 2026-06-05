@@ -11,7 +11,7 @@ import type {
 } from '@shared/schema';
 import { neon } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
-import { count, desc, eq } from "drizzle-orm";
+import { count, desc, eq, ne } from "drizzle-orm";
 
 const sql = neon(process.env.DATABASE_URL!);
 export const db = drizzle({ client: sql });
@@ -25,7 +25,9 @@ export interface IStorage {
   countSavedFiles(): Promise<number>;
   createSavedFile(file: SavedFile): Promise<SavedFile>;
   listCalibrations(): Promise<CalibrationSummary[]>;
+  listCorrections(): Promise<CalibrationSummary[]>;
   countCalibrations(): Promise<number>;
+  countCorrections(): Promise<number>;
   createCalibration(calibration: Calibration): Promise<Calibration>;
   listSyncedRoles(activeOnly?: boolean): Promise<SyncedRole[]>;
   upsertSyncedRole(role: SyncedRole): Promise<{ inserted: boolean }>;
@@ -105,6 +107,35 @@ export class DatabaseStorage implements IStorage {
   async createCalibration(calibration: Calibration): Promise<Calibration> {
     const [row] = await db.insert(calibrations).values(calibration).returning();
     return row;
+  }
+
+  async listCorrections(): Promise<CalibrationSummary[]> {
+    return db
+      .select({
+        id: calibrations.id,
+        candidateKey: calibrations.candidateKey,
+        candidateName: calibrations.candidateName,
+        originalDepartment: calibrations.originalDepartment,
+        originalRole: calibrations.originalRole,
+        originalConfidence: calibrations.originalConfidence,
+        isCorrect: calibrations.isCorrect,
+        correctedDepartment: calibrations.correctedDepartment,
+        correctedRole: calibrations.correctedRole,
+        feedbackReason: calibrations.feedbackReason,
+        createdAt: calibrations.createdAt,
+      })
+      .from(calibrations)
+      .where(ne(calibrations.isCorrect, 1))
+      .orderBy(desc(calibrations.createdAt))
+      .limit(200);
+  }
+
+  async countCorrections(): Promise<number> {
+    const [row] = await db
+      .select({ value: count() })
+      .from(calibrations)
+      .where(ne(calibrations.isCorrect, 1));
+    return row?.value ?? 0;
   }
 
   async countCalibrations(): Promise<number> {

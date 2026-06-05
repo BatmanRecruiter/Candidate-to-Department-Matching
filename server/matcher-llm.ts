@@ -2,7 +2,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { UNSURE, NOT_A_MATCH, HUMAN_REVIEW, type MatchResult } from "@shared/matcher";
 
 const client = new Anthropic();
-const MODEL = "claude-haiku-4-5-20251001";
+const MODEL = "claude-sonnet-4-6";
 
 // Hard blocks run before the LLM call to avoid burning tokens on clearly
 // out-of-scope profiles. These fire only on unambiguous signals.
@@ -42,6 +42,13 @@ const VALID_DEPARTMENTS = new Set([
   NOT_A_MATCH,
   HUMAN_REVIEW,
 ]);
+
+export interface CorrectionExample {
+  candidateName: string;
+  originalDepartment: string;
+  correctedDepartment: string;
+  feedbackReason: string;
+}
 
 function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
@@ -143,6 +150,24 @@ CRITICAL OUTPUT FORMAT: Your ENTIRE response must be a single JSON object and NO
 Valid department values: "Data Engineering", "Analytics", "Machine Learning", "Advisory", "Business Architecture", "Managed Services", "PMO", "Sales", "Unsure / Not Enough Information", "Not a Match for phData", "Needs human review"`;
 }
 
+function buildCorrectionsBlock(corrections: CorrectionExample[]): string {
+  const examples = corrections
+    .map(
+      (c, i) =>
+        `[${i + 1}] ${c.candidateName || "Candidate"}\n` +
+        `    System routed to: ${c.originalDepartment}\n` +
+        `    Recruiter corrected to: ${c.correctedDepartment}\n` +
+        `    Recruiter note: ${c.feedbackReason?.trim() || "(no note provided)"}`,
+    )
+    .join("\n\n");
+
+  return `RECRUITER CORRECTION PATTERNS — ${corrections.length} confirmed misroutes. Weight these heavily when a new candidate fits a similar profile:
+
+${examples}
+
+Apply these patterns: if a new candidate resembles one of the above profiles, route them as the recruiter corrected, not as the system originally guessed.`;
+}
+
 function buildCandidateText(row: Record<string, string>): string {
   return Object.entries(row)
     .filter(([, v]) => String(v ?? "").trim().length > 0)
@@ -185,6 +210,7 @@ function parseConfidence(raw: unknown): 1 | 2 | 3 | "N/A" | "?" {
 
 export async function matchCandidateLLM(
   row: Record<string, string>,
+  corrections: CorrectionExample[] = [],
 ): Promise<MatchResult> {
   const candidateText = buildCandidateText(row);
 
@@ -204,10 +230,32 @@ export async function matchCandidateLLM(
     }
   }
 
+  // System prompt is stable across all candidates — cache_control marks the
+  // end of the cacheable block, giving ~90% cost reduction on input tokens
+  // for the system prompt portion on all calls after the first.
+  const systemBlocks: Array<{
+    type: "text";
+    text: string;
+    cache_control?: { type: "ephemeral" };
+  }> = [
+    {
+      type: "text",
+      text: buildSystemPrompt(),
+      cache_control: { type: "ephemeral" },
+    },
+  ];
+
+  if (corrections.length > 0) {
+    systemBlocks.push({
+      type: "text",
+      text: buildCorrectionsBlock(corrections),
+    });
+  }
+
   const resp = await client.messages.create({
     model: MODEL,
     max_tokens: 512,
-    system: buildSystemPrompt(),
+    system: systemBlocks as Parameters<typeof client.messages.create>[0]["system"],
     messages: [
       {
         role: "user",
@@ -217,7 +265,7 @@ export async function matchCandidateLLM(
     ],
   });
 
-  const textBlock = resp.content.find((b) => b.type === "text") as
+  const textBlock = resp.content.find((b: { type: string }) => b.type === "text") as
     | { type: "text"; text: string }
     | undefined;
   const raw = textBlock?.text ?? "";

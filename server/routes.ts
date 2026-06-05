@@ -9,7 +9,8 @@ import { augmentRoleLibrary, type RoleLibraryJob } from "@shared/matcher";
 import { calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
 import { storage } from "./storage";
 import { runRoleSync, syncedRoleToLibraryJob } from "./role-sync";
-import { matchCandidateLLM } from "./matcher-llm";
+import { matchCandidateLLM, type CorrectionExample } from "./matcher-llm";
+import Anthropic from "@anthropic-ai/sdk";
 // Statically import the role library so esbuild bundles it into the
 // production server build. The dev server also reads the file from disk as a
 // fallback so regenerating the JSON without restarting works.
@@ -84,6 +85,59 @@ function requireAdmin(req: { header(name: string): string | undefined }, res: an
 
 const MAX_SAVED_FILES = 500;
 const MAX_CALIBRATIONS = 3000;
+const TIPPING_POINT = 50;
+
+async function sendSlackNotification(text: string): Promise<void> {
+  const webhookUrl = process.env.SLACK_WEBHOOK_URL;
+  if (!webhookUrl) return;
+  try {
+    await fetch(webhookUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  } catch (err) {
+    console.warn("[slack] notification failed:", err);
+  }
+}
+
+async function generateCalibrationAnalysis(corrections: CorrectionExample[]): Promise<string> {
+  const analysisClient = new Anthropic();
+  const correctionLines = corrections
+    .map(
+      (c, i) =>
+        `${i + 1}. ${c.candidateName || "Unnamed"}: routed to "${c.originalDepartment}" → corrected to "${c.correctedDepartment}"` +
+        (c.feedbackReason ? ` | Note: ${c.feedbackReason}` : ""),
+    )
+    .join("\n");
+
+  const resp = await analysisClient.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: `You are reviewing ${corrections.length} recruiter corrections for an AI candidate-matching system that routes candidates to departments: Data Engineering, Analytics, Machine Learning, Advisory, Business Architecture, Managed Services, PMO, Sales.
+
+Here are all the corrections (original system routing → what recruiter changed it to):
+
+${correctionLines}
+
+Provide a concise analysis in three sections:
+1. PATTERNS: The 2-3 most common misrouting patterns (which departments are confused most often and why)
+2. ROOT CAUSES: What signals the system is likely over- or under-weighting that causes these misroutes
+3. PROMPT RECOMMENDATIONS: Specific, actionable text changes to add to the department descriptions to fix the top misroutes (quote exact additions or clarifications)
+
+Be direct and specific. This will be shared with a recruiter who will update the system prompt.`,
+      },
+    ],
+  });
+
+  const textBlock = resp.content.find((b: { type: string }) => b.type === "text") as
+    | { type: "text"; text: string }
+    | undefined;
+  return textBlock?.text ?? "Analysis could not be generated.";
+}
 
 export async function registerRoutes(
   httpServer: Server,
@@ -245,7 +299,14 @@ export async function registerRoutes(
       if (!row || typeof row !== "object" || Array.isArray(row)) {
         return res.status(400).json({ message: "row must be a plain object" });
       }
-      const result = await matchCandidateLLM(row);
+      const rawCorrections = await storage.listCorrections();
+      const corrections: CorrectionExample[] = rawCorrections.map((c) => ({
+        candidateName: c.candidateName,
+        originalDepartment: c.originalDepartment,
+        correctedDepartment: c.correctedDepartment,
+        feedbackReason: c.feedbackReason,
+      }));
+      const result = await matchCandidateLLM(row, corrections);
       res.json(result);
     } catch (err) {
       next(err);
@@ -261,6 +322,9 @@ export async function registerRoutes(
           message: `Calibration limit reached (${MAX_CALIBRATIONS}).`,
         });
       }
+      const isCorrection = !parsed.isCorrect;
+      const correctionCountBefore = isCorrection ? await storage.countCorrections() : 0;
+
       const saved = await storage.createCalibration({
         id: randomUUID(),
         historyKeyHash: SHARED_HISTORY_HASH,
@@ -277,6 +341,63 @@ export async function registerRoutes(
       });
       const { historyKeyHash: _historyKeyHash, ...safeCalibration } = saved;
       res.status(201).json(safeCalibration);
+
+      // Fire-and-forget: send Slack notification when corrections cross the tipping point.
+      if (isCorrection && correctionCountBefore === TIPPING_POINT - 1) {
+        storage.listCorrections().then(async (corrections) => {
+          const examples: CorrectionExample[] = corrections.map((c) => ({
+            candidateName: c.candidateName,
+            originalDepartment: c.originalDepartment,
+            correctedDepartment: c.correctedDepartment,
+            feedbackReason: c.feedbackReason,
+          }));
+          try {
+            const analysis = await generateCalibrationAnalysis(examples);
+            await sendSlackNotification(
+              `*phData Matcher — Calibration Tipping Point Reached (${TIPPING_POINT} corrections)*\n\n${analysis}\n\n_Open the admin panel to view and act on this analysis._`,
+            );
+            console.log("[calibration] tipping point Slack notification sent");
+          } catch (err) {
+            console.warn("[calibration] tipping point analysis/Slack failed:", err);
+          }
+        });
+      }
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get("/api/calibrations/analysis", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const corrections = await storage.listCorrections();
+      const correctionCount = corrections.length;
+      const tippingPointReached = correctionCount >= TIPPING_POINT;
+
+      if (req.query.generate !== "true") {
+        return res.json({ correctionCount, tippingPoint: TIPPING_POINT, tippingPointReached, analysis: null });
+      }
+
+      if (correctionCount === 0) {
+        return res.json({ correctionCount, tippingPoint: TIPPING_POINT, tippingPointReached, analysis: "No corrections recorded yet." });
+      }
+
+      const examples: CorrectionExample[] = corrections.map((c) => ({
+        candidateName: c.candidateName,
+        originalDepartment: c.originalDepartment,
+        correctedDepartment: c.correctedDepartment,
+        feedbackReason: c.feedbackReason,
+      }));
+
+      const analysis = await generateCalibrationAnalysis(examples);
+
+      if (process.env.SLACK_WEBHOOK_URL) {
+        sendSlackNotification(
+          `*phData Matcher — Calibration Analysis (${correctionCount} corrections)*\n\n${analysis}`,
+        ).catch((err) => console.warn("[slack] send failed:", err));
+      }
+
+      res.json({ correctionCount, tippingPoint: TIPPING_POINT, tippingPointReached, analysis });
     } catch (err) {
       next(err);
     }
