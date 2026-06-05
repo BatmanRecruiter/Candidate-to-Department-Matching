@@ -225,6 +225,117 @@ export default function Home() {
     }
   }, [adminPasscode, toast]);
 
+  // --- Batch mode ---
+  const BATCH_JOBS_KEY = "phdata-batch-jobs";
+
+  interface StoredBatchJob {
+    id: string;
+    batchId: string | null;
+    fileName: string;
+    rowCount: number;
+    submittedAt: number;
+    csvText: string;
+    preResolved: Record<number, MatchResult>;
+  }
+
+  const [batchMode, setBatchMode] = useState(false);
+  const [batchJobs, setBatchJobs] = useState<StoredBatchJob[]>(() => {
+    try {
+      return JSON.parse(localStorage.getItem(BATCH_JOBS_KEY) ?? "[]");
+    } catch {
+      return [];
+    }
+  });
+  const [checkingBatch, setCheckingBatch] = useState<string | null>(null);
+
+  const saveBatchJobs = useCallback((jobs: StoredBatchJob[]) => {
+    setBatchJobs(jobs);
+    localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(jobs));
+  }, []);
+
+  const submitBatch = useCallback(
+    async (file: File) => {
+      const passcode = adminPasscode.trim();
+      if (!passcode) {
+        toast({ title: "Admin passcode required", description: "Enter the admin passcode to submit a batch job.", variant: "destructive" });
+        return;
+      }
+      setError(null);
+      setProcessing(true);
+      setProgress(0);
+      try {
+        const csvText = await file.text();
+        const { rows } = parseCsvText(csvText);
+        if (rows.length === 0) throw new Error("No rows detected in CSV.");
+        if (rows.length > 2000) throw new Error("Batch limit is 2000 rows.");
+
+        const res = await apiRequest("POST", "/api/match/batch", { rows, fileName: file.name }, { "x-admin-passcode": passcode });
+        const data = await res.json() as {
+          batchId: string | null;
+          rowCount: number;
+          preResolved: Record<number, MatchResult>;
+          fileName: string;
+          allPreResolved: boolean;
+        };
+
+        const job: StoredBatchJob = {
+          id: crypto.randomUUID(),
+          batchId: data.batchId,
+          fileName: file.name,
+          rowCount: data.rowCount,
+          submittedAt: Date.now(),
+          csvText,
+          preResolved: data.preResolved ?? {},
+        };
+        saveBatchJobs([job, ...batchJobs]);
+        toast({ title: "Batch submitted", description: `${data.rowCount} candidates queued. Check status in the Batch jobs panel.` });
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Batch submission failed.");
+      } finally {
+        setProcessing(false);
+      }
+    },
+    [adminPasscode, batchJobs, saveBatchJobs, toast],
+  );
+
+  const checkBatchJob = useCallback(
+    async (job: StoredBatchJob) => {
+      const passcode = adminPasscode.trim();
+      if (!passcode) return;
+      if (!job.batchId) return;
+      setCheckingBatch(job.id);
+      try {
+        const res = await apiRequest("GET", `/api/match/batch/${job.batchId}`, undefined, { "x-admin-passcode": passcode });
+        const data = await res.json() as {
+          status: string;
+          results: Record<number, MatchResult> | null;
+        };
+
+        if (data.status !== "ended" || !data.results) {
+          toast({ title: "Still processing", description: `Status: ${data.status}. Check back in a few minutes.` });
+          return;
+        }
+
+        // Merge batch results with pre-resolved hard-block results, then display.
+        const { headers, rows } = parseCsvText(job.csvText);
+        const exportHeaders = buildExportHeaders(headers);
+        const results: MatchResult[] = rows.map((_, i) =>
+          (job.preResolved[i] ?? data.results![i]) as MatchResult,
+        );
+        const exportRows = rows.map((row, i) =>
+          buildExportRow(row, results[i], headers),
+        );
+        setState({ inputHeaders: headers, inputRows: rows, results, exportHeaders, exportRows, fileName: job.fileName });
+        toast({ title: "Batch complete", description: `${job.rowCount} candidates scored. Results loaded below.` });
+      } catch {
+        toast({ title: "Check failed", description: "Could not retrieve batch results.", variant: "destructive" });
+      } finally {
+        setCheckingBatch(null);
+      }
+    },
+    [adminPasscode, toast],
+  );
+
   const byDept = useMemo(() => {
     const m = new Map<string, RoleLibraryJob[]>();
     for (const j of jobs) {
@@ -360,14 +471,14 @@ export default function Home() {
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
-    if (f) processFile(f);
+    if (f) batchMode ? submitBatch(f) : processFile(f);
   };
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
     const f = e.dataTransfer.files?.[0];
-    if (f) processFile(f);
+    if (f) batchMode ? submitBatch(f) : processFile(f);
   };
 
   const onDownload = () => {
@@ -702,6 +813,57 @@ export default function Home() {
                   )}
                 </div>
               )}
+              {adminPasscode.trim() && batchJobs.length > 0 && (
+                <div className="space-y-1.5 rounded-md border border-border/70 bg-background/60 p-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-semibold flex items-center gap-1.5">
+                      <Archive className="h-3.5 w-3.5" /> Batch jobs
+                    </p>
+                    <button
+                      type="button"
+                      className="text-[10px] text-muted-foreground hover:text-foreground"
+                      onClick={() => saveBatchJobs([])}
+                    >
+                      Clear all
+                    </button>
+                  </div>
+                  {batchJobs.slice(0, 5).map((job) => (
+                    <div key={job.id} className="rounded border border-border/50 bg-background p-1.5 space-y-1">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="text-[11px] font-medium truncate flex-1" title={job.fileName}>
+                          {job.fileName}
+                        </p>
+                        <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">
+                          {job.rowCount} rows
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[10px] text-muted-foreground">
+                          {new Date(job.submittedAt).toLocaleString()}
+                        </span>
+                        {job.batchId ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[10px]"
+                            onClick={() => checkBatchJob(job)}
+                            disabled={checkingBatch === job.id}
+                          >
+                            {checkingBatch === job.id ? (
+                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                            ) : (
+                              <RefreshCw className="mr-1 h-3 w-3" />
+                            )}
+                            {checkingBatch === job.id ? "Checking…" : "Check & Load"}
+                          </Button>
+                        ) : (
+                          <span className="text-[10px] text-muted-foreground italic">all pre-resolved</span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
               {adminPasscode.trim() && savedFilesQ.isLoading && (
                 <p className="text-xs text-muted-foreground font-mono">
                   Loading saved files…
@@ -844,8 +1006,25 @@ export default function Home() {
         <section className="lg:col-span-8 space-y-6">
           <Card data-testid="card-upload">
             <CardHeader className="pb-2">
-              <CardTitle className="flex items-center gap-2 text-base">
-                <Upload className="h-4 w-4" /> Upload Candidate CSV
+              <CardTitle className="flex items-center justify-between gap-2 text-base">
+                <span className="flex items-center gap-2">
+                  <Upload className="h-4 w-4" /> Upload Candidate CSV
+                </span>
+                {adminPasscode.trim() && (
+                  <button
+                    type="button"
+                    onClick={() => setBatchMode((m) => !m)}
+                    className={`flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                      batchMode
+                        ? "bg-amber-500/15 text-amber-700 ring-1 ring-amber-500/40"
+                        : "bg-muted text-muted-foreground hover:bg-muted/80"
+                    }`}
+                    title={batchMode ? "Switch to real-time scoring" : "Switch to batch scoring (50% off, ~1 hr)"}
+                  >
+                    {batchMode ? <Archive className="h-3 w-3" /> : <Sparkles className="h-3 w-3" />}
+                    {batchMode ? "Batch mode (50% off)" : "Real-time"}
+                  </button>
+                )}
               </CardTitle>
             </CardHeader>
             <CardContent>

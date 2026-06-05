@@ -17,8 +17,8 @@ app.use(
       directives: {
         defaultSrc: ["'self'"],
         scriptSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        fontSrc: ["'self'", "data:"],
         imgSrc: ["'self'", "data:"],
         connectSrc: ["'self'"],
         objectSrc: ["'none'"],
@@ -53,6 +53,16 @@ app.use(
   rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+  }),
+);
+// Batch submit/status — low limit since each submission can be thousands of rows.
+app.use(
+  "/api/match/batch",
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
     standardHeaders: true,
     legacyHeaders: false,
   }),

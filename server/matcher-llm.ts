@@ -208,12 +208,9 @@ function parseConfidence(raw: unknown): 1 | 2 | "N/A" | "?" {
   return "?";
 }
 
-export async function matchCandidateLLM(
-  row: Record<string, string>,
-  corrections: CorrectionExample[] = [],
-): Promise<MatchResult> {
-  const candidateText = buildCandidateText(row);
-
+// Checks hard-block regex against candidate text. Returns a ready MatchResult
+// if blocked, or null if the candidate should go to the LLM.
+export function checkHardBlock(candidateText: string): MatchResult | null {
   for (const { re, label } of HARD_BLOCKS) {
     if (re.test(candidateText)) {
       return {
@@ -229,50 +226,21 @@ export async function matchCandidateLLM(
       };
     }
   }
+  return null;
+}
 
-  // System prompt is stable across all candidates — cache_control marks the
-  // end of the cacheable block, giving ~90% cost reduction on input tokens
-  // for the system prompt portion on all calls after the first.
-  const systemBlocks: Array<{
-    type: "text";
-    text: string;
-    cache_control?: { type: "ephemeral" };
-  }> = [
-    {
-      type: "text",
-      text: buildSystemPrompt(),
-      cache_control: { type: "ephemeral" },
-    },
-  ];
-
-  if (corrections.length > 0) {
-    systemBlocks.push({
-      type: "text",
-      text: buildCorrectionsBlock(corrections),
-    });
-  }
-
-  const resp = await client.messages.create({
-    model: MODEL,
-    max_tokens: 512,
-    system: systemBlocks as Parameters<typeof client.messages.create>[0]["system"],
-    messages: [
-      {
-        role: "user",
-        content:
-          `Candidate profile:\n${candidateText}\n\nOutput ONLY the JSON object now. Start with { and end with }.`,
-      },
-    ],
-  });
-
-  const textBlock = resp.content.find((b: { type: string }) => b.type === "text") as
+// Parses raw LLM message content into a MatchResult. Used by both real-time
+// and batch result processing so the logic stays in one place.
+export function processMatchContent(
+  content: Array<{ type: string; text?: string }>,
+): MatchResult {
+  const textBlock = content.find((b: { type: string }) => b.type === "text") as
     | { type: "text"; text: string }
     | undefined;
   const raw = textBlock?.text ?? "";
   const found = extractJson(raw);
 
   if (!found) {
-    console.error(`[matcher-llm] no JSON in response: ${raw.slice(0, 200)}`);
     return {
       best_job: null,
       best_score: 0,
@@ -290,7 +258,6 @@ export async function matchCandidateLLM(
   try {
     parsed = JSON.parse(found);
   } catch {
-    console.error(`[matcher-llm] bad JSON: ${found.slice(0, 200)}`);
     return {
       best_job: null,
       best_score: 0,
@@ -321,4 +288,62 @@ export async function matchCandidateLLM(
     candidate_yoe: null,
     candidate_region: "",
   };
+}
+
+// Builds the params object for a single candidate match request. Used directly
+// for real-time calls and as the inner params for each Anthropic batch request.
+export function buildMatchParams(
+  row: Record<string, string>,
+  corrections: CorrectionExample[],
+): {
+  model: string;
+  max_tokens: number;
+  system: unknown;
+  messages: Array<{ role: string; content: string }>;
+} {
+  const candidateText = buildCandidateText(row);
+  const systemBlocks: Array<{
+    type: "text";
+    text: string;
+    cache_control?: { type: "ephemeral" };
+  }> = [
+    {
+      type: "text",
+      text: buildSystemPrompt(),
+      cache_control: { type: "ephemeral" },
+    },
+  ];
+  if (corrections.length > 0) {
+    systemBlocks.push({ type: "text", text: buildCorrectionsBlock(corrections) });
+  }
+  return {
+    model: MODEL,
+    max_tokens: 512,
+    system: systemBlocks,
+    messages: [
+      {
+        role: "user",
+        content: `Candidate profile:\n${candidateText}\n\nOutput ONLY the JSON object now. Start with { and end with }.`,
+      },
+    ],
+  };
+}
+
+export async function matchCandidateLLM(
+  row: Record<string, string>,
+  corrections: CorrectionExample[] = [],
+): Promise<MatchResult> {
+  const candidateText = buildCandidateText(row);
+
+  const hardBlock = checkHardBlock(candidateText);
+  if (hardBlock) return hardBlock;
+
+  const params = buildMatchParams(row, corrections);
+  const resp = await client.messages.create(
+    params as Parameters<typeof client.messages.create>[0],
+  );
+
+  return processMatchContent(
+    resp.content as Array<{ type: string; text?: string }>,
+  );
 }

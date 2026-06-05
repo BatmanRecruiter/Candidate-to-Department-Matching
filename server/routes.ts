@@ -9,7 +9,13 @@ import { augmentRoleLibrary, type RoleLibraryJob } from "@shared/matcher";
 import { calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
 import { storage } from "./storage";
 import { runRoleSync, syncedRoleToLibraryJob } from "./role-sync";
-import { matchCandidateLLM, type CorrectionExample } from "./matcher-llm";
+import {
+  matchCandidateLLM,
+  buildMatchParams,
+  checkHardBlock,
+  processMatchContent,
+  type CorrectionExample,
+} from "./matcher-llm";
 import Anthropic from "@anthropic-ai/sdk";
 // Statically import the role library so esbuild bundles it into the
 // production server build. The dev server also reads the file from disk as a
@@ -362,6 +368,128 @@ export async function registerRoutes(
           }
         });
       }
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // --- Batch API endpoints ---
+  // Accepts parsed candidate rows, submits them to the Anthropic Batch API
+  // (50% cost vs real-time), and returns the Anthropic batch ID immediately.
+  // Hard-block candidates are resolved instantly and returned alongside the ID.
+  app.post("/api/match/batch", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const { rows, fileName } = req.body as {
+        rows: Record<string, string>[];
+        fileName: string;
+      };
+      if (!Array.isArray(rows) || rows.length === 0) {
+        return res.status(400).json({ message: "rows must be a non-empty array" });
+      }
+      if (rows.length > 2000) {
+        return res.status(400).json({ message: "Maximum 2000 rows per batch" });
+      }
+
+      const rawCorrections = await storage.listCorrections();
+      const corrections: CorrectionExample[] = rawCorrections.map((c) => ({
+        candidateName: c.candidateName,
+        originalDepartment: c.originalDepartment,
+        correctedDepartment: c.correctedDepartment,
+        feedbackReason: c.feedbackReason,
+      }));
+
+      const batchClient = new Anthropic();
+      const batchRequests: Array<{ custom_id: string; params: unknown }> = [];
+      const preResolved: Record<number, unknown> = {};
+
+      for (let i = 0; i < rows.length; i++) {
+        const candidateText = Object.entries(rows[i])
+          .filter(([, v]) => String(v ?? "").trim().length > 0)
+          .map(([k, v]) => `${k}: ${String(v).slice(0, 3000)}`)
+          .join("\n");
+        const hardBlock = checkHardBlock(candidateText);
+        if (hardBlock) {
+          preResolved[i] = hardBlock;
+        } else {
+          batchRequests.push({
+            custom_id: `candidate-${i}`,
+            params: buildMatchParams(rows[i], corrections),
+          });
+        }
+      }
+
+      if (batchRequests.length === 0) {
+        return res.json({
+          batchId: null,
+          rowCount: rows.length,
+          preResolved,
+          fileName,
+          allPreResolved: true,
+        });
+      }
+
+      const batch = await batchClient.messages.batches.create({
+        requests: batchRequests as Parameters<
+          typeof batchClient.messages.batches.create
+        >[0]["requests"],
+      });
+
+      res.json({
+        batchId: batch.id,
+        rowCount: rows.length,
+        preResolved,
+        fileName,
+        allPreResolved: false,
+      });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Checks Anthropic batch status. When ended, streams results, processes them,
+  // and returns the full MatchResult array indexed to the original row order.
+  app.get("/api/match/batch/:id", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const batchClient = new Anthropic();
+      const batch = await batchClient.messages.batches.retrieve(req.params.id);
+
+      if (batch.processing_status !== "ended") {
+        return res.json({
+          status: batch.processing_status,
+          requestCounts: batch.request_counts,
+          results: null,
+        });
+      }
+
+      const results: Record<number, unknown> = {};
+      for await (const item of await batchClient.messages.batches.results(
+        req.params.id,
+      )) {
+        const idx = parseInt((item.custom_id as string).replace("candidate-", ""), 10);
+        if ((item.result as { type: string }).type === "succeeded") {
+          const msg = (item.result as { type: "succeeded"; message: { content: unknown[] } }).message;
+          results[idx] = processMatchContent(
+            msg.content as Array<{ type: string; text?: string }>,
+          );
+        } else {
+          const { HUMAN_REVIEW } = await import("@shared/matcher");
+          results[idx] = {
+            best_job: null,
+            best_score: 0,
+            department: HUMAN_REVIEW,
+            role: "",
+            rationale: `Batch item ${item.result.type ?? "failed"}.`,
+            confidence: "?",
+            best_dept_score: 0,
+            candidate_yoe: null,
+            candidate_region: "",
+          };
+        }
+      }
+
+      res.json({ status: "ended", requestCounts: batch.request_counts, results });
     } catch (err) {
       next(err);
     }
