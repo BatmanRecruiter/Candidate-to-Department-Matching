@@ -236,6 +236,7 @@ export default function Home() {
     submittedAt: number;
     csvText: string;
     preResolved: Record<number, MatchResult>;
+    status: "pending" | "complete" | "error";
   }
 
   const [batchMode, setBatchMode] = useState(false);
@@ -286,9 +287,10 @@ export default function Home() {
           submittedAt: Date.now(),
           csvText,
           preResolved: data.preResolved ?? {},
+          status: "pending",
         };
         saveBatchJobs([job, ...batchJobs]);
-        toast({ title: "Batch submitted", description: `${data.rowCount} candidates queued. Check status in the Batch jobs panel.` });
+        toast({ title: "Batch submitted", description: `${data.rowCount} candidates queued. Results will auto-load when ready.` });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Batch submission failed.");
       } finally {
@@ -299,22 +301,33 @@ export default function Home() {
   );
 
   const checkBatchJob = useCallback(
-    async (job: StoredBatchJob) => {
+    async (job: StoredBatchJob, { silent = false }: { silent?: boolean } = {}) => {
       const passcode = adminPasscode.trim();
-      if (!passcode) return;
-      if (!job.batchId) return;
-      setCheckingBatch(job.id);
+      if (!passcode || !job.batchId) return;
+      if (!silent) setCheckingBatch(job.id);
       try {
-        const res = await apiRequest("GET", `/api/match/batch/${job.batchId}`, undefined, { "x-admin-passcode": passcode });
+        const res = await apiRequest(
+          "GET",
+          `/api/match/batch/${job.batchId}?fileName=${encodeURIComponent(job.fileName)}`,
+          undefined,
+          { "x-admin-passcode": passcode },
+        );
         const data = await res.json() as {
           status: string;
           results: Record<number, MatchResult> | null;
         };
 
         if (data.status !== "ended" || !data.results) {
-          toast({ title: "Still processing", description: `Status: ${data.status}. Check back in a few minutes.` });
+          if (!silent) toast({ title: "Still processing", description: `Status: ${data.status}. Polling every 30 s.` });
           return;
         }
+
+        // Mark job complete in localStorage.
+        setBatchJobs((prev) => {
+          const updated = prev.map((j) => j.id === job.id ? { ...j, status: "complete" as const } : j);
+          localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(updated));
+          return updated;
+        });
 
         // Merge batch results with pre-resolved hard-block results, then display.
         const { headers, rows } = parseCsvText(job.csvText);
@@ -328,13 +341,26 @@ export default function Home() {
         setState({ inputHeaders: headers, inputRows: rows, results, exportHeaders, exportRows, fileName: job.fileName });
         toast({ title: "Batch complete", description: `${job.rowCount} candidates scored. Results loaded below.` });
       } catch {
-        toast({ title: "Check failed", description: "Could not retrieve batch results.", variant: "destructive" });
+        if (!silent) toast({ title: "Check failed", description: "Could not retrieve batch results.", variant: "destructive" });
       } finally {
-        setCheckingBatch(null);
+        if (!silent) setCheckingBatch(null);
       }
     },
     [adminPasscode, toast],
   );
+
+  // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
+  useEffect(() => {
+    const passcode = adminPasscode.trim();
+    const pending = batchJobs.filter((j) => j.batchId && j.status === "pending");
+    if (!pending.length || !passcode) return;
+
+    const interval = setInterval(() => {
+      pending.forEach((job) => checkBatchJob(job, { silent: true }));
+    }, 30_000);
+
+    return () => clearInterval(interval);
+  }, [batchJobs, adminPasscode, checkBatchJob]);
 
   const byDept = useMemo(() => {
     const m = new Map<string, RoleLibraryJob[]>();

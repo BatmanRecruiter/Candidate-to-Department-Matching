@@ -490,6 +490,17 @@ export async function registerRoutes(
       }
 
       res.json({ status: "ended", requestCounts: batch.request_counts, results });
+
+      // Fire-and-forget Slack notification when batch completes.
+      const fileName = typeof req.query.fileName === "string" ? req.query.fileName : "batch job";
+      const counts = batch.request_counts as { succeeded: number; errored: number };
+      sendSlackNotification(
+        `*phData Matcher — Batch Complete* ✓\n` +
+        `File: ${fileName}\n` +
+        `${counts.succeeded} candidates scored` +
+        (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
+        `\nResults have been auto-loaded in the app.`,
+      ).catch(() => {});
     } catch (err) {
       next(err);
     }
