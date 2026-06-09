@@ -1,7 +1,6 @@
-import Anthropic from "@anthropic-ai/sdk";
+import { cachedMessage } from "./anthropicClient";
 import { UNSURE, NOT_A_MATCH, HUMAN_REVIEW, type MatchResult } from "@shared/matcher";
 
-const client = new Anthropic();
 const MODEL = "claude-sonnet-4-6";
 
 // Hard blocks run before the LLM call to avoid burning tokens on clearly
@@ -310,7 +309,7 @@ export function buildMatchParams(
     {
       type: "text",
       text: buildSystemPrompt(),
-      cache_control: { type: "ephemeral" },
+      cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ];
   if (corrections.length > 0) {
@@ -338,10 +337,22 @@ export async function matchCandidateLLM(
   const hardBlock = checkHardBlock(candidateText);
   if (hardBlock) return hardBlock;
 
-  const params = buildMatchParams(row, corrections);
-  const resp = await client.messages.create(
-    params as Parameters<typeof client.messages.create>[0],
-  );
+  let systemText = buildSystemPrompt();
+  if (corrections.length > 0) {
+    systemText = `${systemText}\n\n${buildCorrectionsBlock(corrections)}`;
+  }
+
+  const resp = await cachedMessage({
+    system: systemText,
+    messages: [
+      {
+        role: "user",
+        content: `Candidate profile:\n${candidateText}\n\nOutput ONLY the JSON object now. Start with { and end with }.`,
+      },
+    ],
+    model: MODEL,
+    maxTokens: 512,
+  });
 
   return processMatchContent(
     resp.content as Array<{ type: string; text?: string }>,

@@ -37,7 +37,8 @@ import {
   Eye,
 } from "lucide-react";
 import { PhDataMark } from "@/components/logo";
-import { parseCsvText, rowsToCsv, downloadCsv } from "@/lib/csv";
+import { parseCsvText, rowsToCsv } from "@/lib/csv";
+import { downloadXlsx } from "@/lib/xlsx";
 import {
   buildExportHeaders,
   buildExportRow,
@@ -509,8 +510,11 @@ export default function Home() {
 
   const onDownload = () => {
     if (!state) return;
-    const csv = rowsToCsv(state.exportHeaders, state.exportRows);
-    downloadCsv(`${state.fileName}__phData-scored.csv`, csv);
+    downloadXlsx(
+      `${state.fileName}__phData-scored.xlsx`,
+      state.exportHeaders,
+      state.exportRows,
+    );
   };
 
   const onDownloadSaved = async (id: string) => {
@@ -519,7 +523,9 @@ export default function Home() {
         "x-admin-passcode": adminPasscode.trim(),
       });
       const file = await res.json();
-      downloadCsv(file.fileName, file.csvText);
+      const { headers: savedHeaders, rows: savedRows } = parseCsvText(file.csvText);
+      const rowArrays = savedRows.map((r) => savedHeaders.map((h) => r[h] ?? ""));
+      downloadXlsx(file.fileName, savedHeaders, rowArrays);
     } catch (err) {
       toast({
         title: "Could not download saved file",
