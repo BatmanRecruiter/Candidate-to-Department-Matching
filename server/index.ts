@@ -76,14 +76,16 @@ declare module "http" {
 
 app.use(
   express.json({
-    limit: "6mb",
+    // ~25 MB covers a full 2,000-row batch of text-heavy LinkedIn profiles
+    // serialized to JSON (column names repeat per row, so JSON > raw CSV size).
+    limit: "25mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },
   }),
 );
 
-app.use(express.urlencoded({ extended: false, limit: "6mb" }));
+app.use(express.urlencoded({ extended: false, limit: "25mb" }));
 
 export function log(message: string, source = "express") {
   const formattedTime = new Date().toLocaleTimeString("en-US", {
