@@ -18,7 +18,6 @@ export const COLUMN_TEMPLATE: string[] = [
   "Company1",
   "Title1",
   "YAC",
-  "Company1 Start Date",
   "Company1 End Date",
   "Company2",
   "Company2 Title",
@@ -31,7 +30,6 @@ export const COLUMN_TEMPLATE: string[] = [
   "Blank",
   "Blank",
   "Blank",
-  "Total YOE",
 ];
 
 export const APPENDED_COLUMNS: string[] = [

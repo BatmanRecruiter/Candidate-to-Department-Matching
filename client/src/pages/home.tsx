@@ -249,11 +249,18 @@ export default function Home() {
     }
   });
   const [checkingBatch, setCheckingBatch] = useState<string | null>(null);
+  const [downloadingBatch, setDownloadingBatch] = useState<string | null>(null);
 
-  const saveBatchJobs = useCallback((jobs: StoredBatchJob[]) => {
-    setBatchJobs(jobs);
-    localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(jobs));
-  }, []);
+  const saveBatchJobs = useCallback(
+    (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
+      setBatchJobs((prev) => {
+        const next = typeof update === "function" ? update(prev) : update;
+        localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(next));
+        return next;
+      });
+    },
+    [],
+  );
 
   const submitBatch = useCallback(
     async (file: File) => {
@@ -290,7 +297,7 @@ export default function Home() {
           preResolved: data.preResolved ?? {},
           status: "pending",
         };
-        saveBatchJobs([job, ...batchJobs]);
+        saveBatchJobs((prev) => [job, ...prev]);
         toast({ title: "Batch submitted", description: `${data.rowCount} candidates queued. Results will auto-load when ready.` });
       } catch (err) {
         setError(err instanceof Error ? err.message : "Batch submission failed.");
@@ -298,30 +305,54 @@ export default function Home() {
         setProcessing(false);
       }
     },
-    [adminPasscode, batchJobs, saveBatchJobs, toast],
+    [adminPasscode, saveBatchJobs, toast],
   );
 
-  const checkBatchJob = useCallback(
-    async (job: StoredBatchJob, { silent = false }: { silent?: boolean } = {}) => {
-      const passcode = adminPasscode.trim();
-      if (!passcode || !job.batchId) return;
-      if (!silent) setCheckingBatch(job.id);
-      try {
+  const submitBatchFiles = useCallback(
+    async (files: File[]) => {
+      for (const file of files) {
+        await submitBatch(file);
+      }
+    },
+    [submitBatch],
+  );
+
+  // Fetches (or reads pre-resolved) results for one batch job and builds its
+  // export rows, without touching the shared results table. Used by both
+  // "Check & Load" and the per-job "Download" button.
+  const fetchBatchResults = useCallback(
+    async (
+      job: StoredBatchJob,
+    ): Promise<
+      | {
+          ready: true;
+          headers: string[];
+          rows: Record<string, string>[];
+          exportHeaders: string[];
+          exportRows: string[][];
+          results: MatchResult[];
+        }
+      | { ready: false; status: string }
+    > => {
+      const { headers, rows } = parseCsvText(job.csvText);
+      const exportHeaders = buildExportHeaders(headers);
+
+      let resultsByIndex: Record<number, MatchResult> = job.preResolved;
+      if (job.batchId) {
         const res = await apiRequest(
           "GET",
           `/api/match/batch/${job.batchId}?fileName=${encodeURIComponent(job.fileName)}`,
           undefined,
-          { "x-admin-passcode": passcode },
+          { "x-admin-passcode": adminPasscode.trim() },
         );
         const data = await res.json() as {
           status: string;
           results: Record<number, MatchResult> | null;
         };
-
         if (data.status !== "ended" || !data.results) {
-          if (!silent) toast({ title: "Still processing", description: `Status: ${data.status}. Polling every 30 s.` });
-          return;
+          return { ready: false, status: data.status };
         }
+        resultsByIndex = { ...job.preResolved, ...data.results };
 
         // Mark job complete in localStorage.
         setBatchJobs((prev) => {
@@ -329,17 +360,33 @@ export default function Home() {
           localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(updated));
           return updated;
         });
+      }
 
-        // Merge batch results with pre-resolved hard-block results, then display.
-        const { headers, rows } = parseCsvText(job.csvText);
-        const exportHeaders = buildExportHeaders(headers);
-        const results: MatchResult[] = rows.map((_, i) =>
-          (job.preResolved[i] ?? data.results![i]) as MatchResult,
-        );
-        const exportRows = rows.map((row, i) =>
-          buildExportRow(row, results[i], headers),
-        );
-        setState({ inputHeaders: headers, inputRows: rows, results, exportHeaders, exportRows, fileName: job.fileName });
+      const results: MatchResult[] = rows.map((_, i) => resultsByIndex[i] as MatchResult);
+      const exportRows = rows.map((row, i) => buildExportRow(row, results[i], headers));
+      return { ready: true, headers, rows, exportHeaders, exportRows, results };
+    },
+    [adminPasscode],
+  );
+
+  const checkBatchJob = useCallback(
+    async (job: StoredBatchJob, { silent = false }: { silent?: boolean } = {}) => {
+      if (!adminPasscode.trim() || !job.batchId) return;
+      if (!silent) setCheckingBatch(job.id);
+      try {
+        const resolved = await fetchBatchResults(job);
+        if (!resolved.ready) {
+          if (!silent) toast({ title: "Still processing", description: `Status: ${resolved.status}. Polling every 30 s.` });
+          return;
+        }
+        setState({
+          inputHeaders: resolved.headers,
+          inputRows: resolved.rows,
+          results: resolved.results,
+          exportHeaders: resolved.exportHeaders,
+          exportRows: resolved.exportRows,
+          fileName: job.fileName,
+        });
         toast({ title: "Batch complete", description: `${job.rowCount} candidates scored. Results loaded below.` });
       } catch {
         if (!silent) toast({ title: "Check failed", description: "Could not retrieve batch results.", variant: "destructive" });
@@ -347,7 +394,27 @@ export default function Home() {
         if (!silent) setCheckingBatch(null);
       }
     },
-    [adminPasscode, toast],
+    [adminPasscode, fetchBatchResults, toast],
+  );
+
+  const downloadBatchJob = useCallback(
+    async (job: StoredBatchJob) => {
+      setDownloadingBatch(job.id);
+      try {
+        const resolved = await fetchBatchResults(job);
+        if (!resolved.ready) {
+          toast({ title: "Still processing", description: `Status: ${resolved.status}. Try again shortly.` });
+          return;
+        }
+        const baseName = job.fileName.replace(/\.csv$/i, "");
+        downloadXlsx(`${baseName}__phData-scored.xlsx`, resolved.exportHeaders, resolved.exportRows);
+      } catch {
+        toast({ title: "Download failed", description: "Could not retrieve batch results.", variant: "destructive" });
+      } finally {
+        setDownloadingBatch(null);
+      }
+    },
+    [fetchBatchResults, toast],
   );
 
   // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
@@ -497,15 +564,26 @@ export default function Home() {
   );
 
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0];
-    if (f) batchMode ? submitBatch(f) : processFile(f);
+    const files = Array.from(e.target.files ?? []);
+    e.target.value = "";
+    if (files.length === 0) return;
+    if (batchMode) {
+      submitBatchFiles(files);
+    } else {
+      processFile(files[0]);
+    }
   };
 
   const onDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const f = e.dataTransfer.files?.[0];
-    if (f) batchMode ? submitBatch(f) : processFile(f);
+    const files = Array.from(e.dataTransfer.files ?? []);
+    if (files.length === 0) return;
+    if (batchMode) {
+      submitBatchFiles(files);
+    } else {
+      processFile(files[0]);
+    }
   };
 
   const onDownload = () => {
@@ -859,41 +937,57 @@ export default function Home() {
                       Clear all
                     </button>
                   </div>
-                  {batchJobs.slice(0, 5).map((job) => (
-                    <div key={job.id} className="rounded border border-border/50 bg-background p-1.5 space-y-1">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-[11px] font-medium truncate flex-1" title={job.fileName}>
-                          {job.fileName}
-                        </p>
-                        <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">
-                          {job.rowCount} rows
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between gap-2">
-                        <span className="text-[10px] text-muted-foreground">
-                          {new Date(job.submittedAt).toLocaleString()}
-                        </span>
-                        {job.batchId ? (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            className="h-6 px-2 text-[10px]"
-                            onClick={() => checkBatchJob(job)}
-                            disabled={checkingBatch === job.id}
-                          >
-                            {checkingBatch === job.id ? (
-                              <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                            ) : (
-                              <RefreshCw className="mr-1 h-3 w-3" />
+                  <div className="max-h-80 overflow-y-auto space-y-1.5 pr-0.5">
+                    {batchJobs.slice(0, 50).map((job) => (
+                      <div key={job.id} className="rounded border border-border/50 bg-background p-1.5 space-y-1">
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-[11px] font-medium truncate flex-1" title={job.fileName}>
+                            {job.fileName}
+                          </p>
+                          <span className="text-[10px] font-mono text-muted-foreground whitespace-nowrap">
+                            {job.rowCount} rows
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-[10px] text-muted-foreground">
+                            {new Date(job.submittedAt).toLocaleString()}
+                          </span>
+                          <div className="flex items-center gap-1.5">
+                            {job.batchId && (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 px-2 text-[10px]"
+                                onClick={() => checkBatchJob(job)}
+                                disabled={checkingBatch === job.id}
+                              >
+                                {checkingBatch === job.id ? (
+                                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                ) : (
+                                  <RefreshCw className="mr-1 h-3 w-3" />
+                                )}
+                                {checkingBatch === job.id ? "Checking…" : "Check & Load"}
+                              </Button>
                             )}
-                            {checkingBatch === job.id ? "Checking…" : "Check & Load"}
-                          </Button>
-                        ) : (
-                          <span className="text-[10px] text-muted-foreground italic">all pre-resolved</span>
-                        )}
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="h-6 px-2 text-[10px]"
+                              onClick={() => downloadBatchJob(job)}
+                              disabled={downloadingBatch === job.id}
+                            >
+                              {downloadingBatch === job.id ? (
+                                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                              ) : (
+                                <Download className="mr-1 h-3 w-3" />
+                              )}
+                              {downloadingBatch === job.id ? "…" : "Download"}
+                            </Button>
+                          </div>
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
               )}
               {adminPasscode.trim() && savedFilesQ.isLoading && (
@@ -1078,7 +1172,7 @@ export default function Home() {
                 <FileSpreadsheet className="h-8 w-8 mx-auto mb-3 text-muted-foreground" />
                 <p className="text-sm">
                   <span className="font-medium">Click to choose</span> or drag and
-                  drop a LinkedIn export CSV
+                  drop {batchMode ? "one or more LinkedIn export CSVs" : "a LinkedIn export CSV"}
                 </p>
                 <p className="text-xs text-muted-foreground mt-1 font-mono">
                   template export columns · department evaluation columns appended · LLM-scored server-side
@@ -1088,6 +1182,7 @@ export default function Home() {
                   ref={fileInputRef}
                   type="file"
                   accept=".csv,text/csv"
+                  multiple={batchMode}
                   className="hidden"
                   onChange={onFileChange}
                   data-testid="input-csv-file"
