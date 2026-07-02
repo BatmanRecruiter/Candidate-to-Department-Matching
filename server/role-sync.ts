@@ -14,6 +14,7 @@ import { randomUUID } from "node:crypto";
 import type { RoleLibraryJob } from "@shared/matcher";
 import type { SyncedRole } from "@shared/schema";
 import { storage } from "./storage";
+import { summarizeRole } from "./role-summary";
 
 const GREENHOUSE_BOARD_URL =
   "https://boards-api.greenhouse.io/v1/boards/phdata/jobs?content=true";
@@ -238,6 +239,7 @@ function normalizeJob(j: GreenhouseJob, now: number): SyncedRole | null {
     body,
     searchText,
     source: "greenhouse",
+    summary: null,
     isActive: 1,
     firstSeenAt: now,
     lastSeenAt: now,
@@ -268,6 +270,7 @@ export function syncedRoleToLibraryJob(row: SyncedRole): RoleLibraryJob {
     preferred_skills: preferred,
     search_text: row.searchText,
     body: row.body,
+    summary: row.summary ?? undefined,
   };
 }
 
@@ -316,7 +319,25 @@ export async function runRoleSync(
         continue;
       }
       seenIds.push(normalized.jobId);
-      const { inserted } = await storage.upsertSyncedRole(normalized);
+      const { inserted, needsSummary } = await storage.upsertSyncedRole(normalized);
+      if (needsSummary) {
+        // Summaries are generated once and stored so the matching prompt's
+        // digest stays byte-stable. A failed summary must never fail the
+        // sync — the digest falls back to a structured-fields line.
+        try {
+          const summary = await summarizeRole(
+            normalized.title,
+            normalized.department,
+            normalized.body,
+          );
+          await storage.updateSyncedRoleSummary(normalized.jobId, summary);
+        } catch (err) {
+          console.warn(
+            `[role-sync] summary generation failed for ${normalized.jobId} (${normalized.title}):`,
+            err instanceof Error ? err.message : err,
+          );
+        }
+      }
       if (inserted) {
         rolesNew++;
         newRoles.push({

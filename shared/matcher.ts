@@ -27,6 +27,10 @@ export interface RoleLibraryJob {
   preferred_skills: string[];
   search_text: string;
   body: string;
+  /** true = currently posted on the live feed; false = historical (no longer posted); undefined = bundled/internal with no status. */
+  is_active?: boolean;
+  /** 1-2 sentence responsibilities + qualifications summary, generated once and stored. */
+  summary?: string;
 }
 
 export interface MatchResult {
