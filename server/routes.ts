@@ -382,6 +382,19 @@ export async function registerRoutes(
     }
   });
 
+  // Cancels an in-flight Anthropic batch. Requests the batch already finished
+  // internally stay billed, but no further candidates are processed.
+  app.post("/api/match/batch/:id/cancel", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const batchClient = new Anthropic();
+      const batch = await batchClient.messages.batches.cancel(req.params.id);
+      res.json({ status: batch.processing_status });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   // Checks Anthropic batch status. When ended, streams results, processes them,
   // and returns the full MatchResult array indexed to the original row order.
   app.get("/api/match/batch/:id", async (req, res, next) => {
