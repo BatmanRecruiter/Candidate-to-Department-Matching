@@ -1,7 +1,7 @@
 import { cachedMessage } from "./anthropicClient";
 import { UNSURE, NOT_A_MATCH, HUMAN_REVIEW, type MatchResult } from "@shared/matcher";
 
-const MODEL = "claude-sonnet-4-6";
+const MODEL = "claude-sonnet-5";
 
 // Hard blocks run before the LLM call to avoid burning tokens on clearly
 // out-of-scope profiles. These fire only on unambiguous signals.
@@ -298,6 +298,7 @@ export function buildMatchParams(
   model: string;
   max_tokens: number;
   system: unknown;
+  thinking: { type: "disabled" };
   messages: Array<{ role: string; content: string }>;
 } {
   const candidateText = buildCandidateText(row);
@@ -319,6 +320,7 @@ export function buildMatchParams(
     model: MODEL,
     max_tokens: 512,
     system: systemBlocks,
+    thinking: { type: "disabled" },
     messages: [
       {
         role: "user",
@@ -352,6 +354,7 @@ export async function matchCandidateLLM(
     ],
     model: MODEL,
     maxTokens: 512,
+    thinking: { type: "disabled" },
   });
 
   return processMatchContent(

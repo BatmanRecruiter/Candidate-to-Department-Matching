@@ -31,6 +31,8 @@ type CachedMessageOptions = {
   maxTokens?: number;
   /** Cache lifetime. "1h" (default) is best for calls spaced more than 5 min apart. */
   ttl?: "1h" | "5m";
+  /** Omit to use the model's own default. Pass { type: "disabled" } to keep thinking off on models where it's on by default. */
+  thinking?: Anthropic.ThinkingConfigParam;
 };
 
 export async function cachedMessage({
@@ -40,12 +42,17 @@ export async function cachedMessage({
   model = "claude-sonnet-4-6",
   maxTokens = 1024,
   ttl = "1h",
+  thinking,
 }: CachedMessageOptions) {
   const request: Anthropic.MessageCreateParamsNonStreaming = {
     model,
     max_tokens: maxTokens,
     messages,
   };
+
+  if (thinking) {
+    request.thinking = thinking;
+  }
 
   if (tools && tools.length > 0) {
     request.tools = tools;

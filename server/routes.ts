@@ -118,8 +118,9 @@ async function generateCalibrationAnalysis(corrections: CorrectionExample[]): Pr
     .join("\n");
 
   const resp = await analysisClient.messages.create({
-    model: "claude-sonnet-4-6",
+    model: "claude-sonnet-5",
     max_tokens: 1024,
+    thinking: { type: "disabled" },
     messages: [
       {
         role: "user",
