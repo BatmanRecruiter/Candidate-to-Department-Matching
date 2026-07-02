@@ -44,6 +44,7 @@ export const syncedRoles = pgTable("synced_roles", {
   body: text("body").notNull(),
   searchText: text("search_text").notNull(),
   source: text("source").notNull(), // "greenhouse" | "manual"
+  summary: text("summary"), // LLM-generated responsibilities/qualifications digest, filled once per role
   isActive: integer("is_active").notNull().default(1),
   firstSeenAt: bigint("first_seen_at", { mode: "number" }).notNull(),
   lastSeenAt: bigint("last_seen_at", { mode: "number" }).notNull(),

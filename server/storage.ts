@@ -30,7 +30,10 @@ export interface IStorage {
   countCorrections(): Promise<number>;
   createCalibration(calibration: Calibration): Promise<Calibration>;
   listSyncedRoles(activeOnly?: boolean): Promise<SyncedRole[]>;
-  upsertSyncedRole(role: SyncedRole): Promise<{ inserted: boolean }>;
+  upsertSyncedRole(
+    role: SyncedRole,
+  ): Promise<{ inserted: boolean; needsSummary: boolean }>;
+  updateSyncedRoleSummary(jobId: string, summary: string): Promise<void>;
   deactivateSyncedRolesNotIn(activeIds: string[], now: number): Promise<number>;
   recordSyncRun(run: SyncRun): Promise<SyncRun>;
   latestSyncRun(): Promise<SyncRun | undefined>;
@@ -150,9 +153,15 @@ export class DatabaseStorage implements IStorage {
     return db.select().from(syncedRoles);
   }
 
-  async upsertSyncedRole(role: SyncedRole): Promise<{ inserted: boolean }> {
+  async upsertSyncedRole(
+    role: SyncedRole,
+  ): Promise<{ inserted: boolean; needsSummary: boolean }> {
     const [existing] = await db
-      .select({ jobId: syncedRoles.jobId })
+      .select({
+        jobId: syncedRoles.jobId,
+        body: syncedRoles.body,
+        summary: syncedRoles.summary,
+      })
       .from(syncedRoles)
       .where(eq(syncedRoles.jobId, role.jobId));
     if (existing) {
@@ -175,10 +184,22 @@ export class DatabaseStorage implements IStorage {
           lastSeenAt: role.lastSeenAt,
         })
         .where(eq(syncedRoles.jobId, role.jobId));
-      return { inserted: false };
+      // Note: the update above intentionally leaves `summary` untouched.
+      // Re-summarize only when the posting text changed, or to fill a gap.
+      return {
+        inserted: false,
+        needsSummary: existing.summary == null || existing.body !== role.body,
+      };
     }
     await db.insert(syncedRoles).values(role);
-    return { inserted: true };
+    return { inserted: true, needsSummary: true };
+  }
+
+  async updateSyncedRoleSummary(jobId: string, summary: string): Promise<void> {
+    await db
+      .update(syncedRoles)
+      .set({ summary })
+      .where(eq(syncedRoles.jobId, jobId));
   }
 
   async deactivateSyncedRolesNotIn(

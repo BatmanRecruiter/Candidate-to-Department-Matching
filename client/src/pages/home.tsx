@@ -178,7 +178,7 @@ export default function Home() {
       } else {
         toast({
           title: result.status === "partial" ? "Role sync partial" : "Role sync complete",
-          description: `${result.rolesFound} found · ${result.rolesNew} new · ${result.rolesUpdated} updated · ${result.rolesDeactivated} deactivated`,
+          description: `${result.rolesFound} found · ${result.rolesNew} new · ${result.rolesUpdated} updated · ${result.rolesDeactivated} no longer posted`,
         });
       }
     } catch (err) {
@@ -805,15 +805,16 @@ export default function Home() {
                   </div>
                   <p className="text-[11px] text-muted-foreground leading-relaxed">
                     Pulls current open phData jobs from the public Greenhouse
-                    board. Historical roles stay in the library; matched
-                    candidates can still hit past openings.
+                    board. Roles that leave the board are kept as historical —
+                    every past and present role stays in the library and
+                    informs department matching.
                   </p>
                   {roleSyncStatusQ.data && (
                     <div className="text-[11px] font-mono text-muted-foreground space-y-0.5">
                       <div>
                         bundled {roleSyncStatusQ.data.bundledRolesCount} ·
-                        active synced {roleSyncStatusQ.data.syncedRolesActive} ·
-                        total synced {roleSyncStatusQ.data.syncedRolesTotal}
+                        currently posted {roleSyncStatusQ.data.syncedRolesActive} ·
+                        all synced {roleSyncStatusQ.data.syncedRolesTotal} (history kept)
                       </div>
                       {roleSyncStatusQ.data.lastRun ? (
                         <div data-testid="text-last-sync">
@@ -824,7 +825,7 @@ export default function Home() {
                           {" · "}
                           new {roleSyncStatusQ.data.lastRun.rolesNew} /
                           upd {roleSyncStatusQ.data.lastRun.rolesUpdated} /
-                          deact {roleSyncStatusQ.data.lastRun.rolesDeactivated}
+                          ended {roleSyncStatusQ.data.lastRun.rolesDeactivated}
                         </div>
                       ) : (
                         <div>no sync run yet</div>
@@ -839,7 +840,8 @@ export default function Home() {
                           {lastSyncResult.rolesNew} new
                         </span>
                         , {lastSyncResult.rolesUpdated} already known,{" "}
-                        {lastSyncResult.rolesDeactivated} deactivated.
+                        {lastSyncResult.rolesDeactivated} no longer posted (kept
+                        as historical).
                       </div>
                       {lastSyncResult.newRoles.length > 0 && (
                         <div className="font-mono">
@@ -1089,6 +1091,12 @@ export default function Home() {
                           <span className="min-w-0 break-words">
                             {j.title}
                             <span className="opacity-50"> · {j.region}</span>
+                            {j.is_active === false && (
+                              <span className="opacity-50 italic">
+                                {" "}
+                                · no longer posted
+                              </span>
+                            )}
                           </span>
                         </li>
                       ))}

@@ -53,7 +53,14 @@ function todayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
-function buildSystemPrompt(): string {
+// The digest of real phData postings (built once from the role library and
+// cached — see server/role-library.ts) slots in AFTER the hand-written
+// taxonomy, which stays byte-for-byte identical and remains the primary
+// guide. Passing "" appends nothing, keeping this callable without a DB.
+function buildSystemPrompt(libraryDigest: string): string {
+  const digestSection = libraryDigest.trim()
+    ? `${libraryDigest.trim()}\n\n---\n\n`
+    : "";
   return `You are an expert technical recruiter at phData, a data and AI consulting firm. Evaluate each candidate and return which phData department they best fit, or whether they are not a match.
 
 TODAY'S DATE: ${todayIso()}
@@ -119,7 +126,7 @@ Does NOT fit: Non-sales professionals. Marketing. Technical roles with some sale
 
 ---
 
-## Not a Match for phData
+${digestSection}## Not a Match for phData
 Return "Not a Match for phData" when the candidate's background is primarily:
 - M&A, investment banking, private equity, hedge funds
 - Supply chain management, procurement, logistics
@@ -294,6 +301,7 @@ export function processMatchContent(
 export function buildMatchParams(
   row: Record<string, string>,
   corrections: CorrectionExample[],
+  libraryDigest: string,
 ): {
   model: string;
   max_tokens: number;
@@ -309,7 +317,7 @@ export function buildMatchParams(
   }> = [
     {
       type: "text",
-      text: buildSystemPrompt(),
+      text: buildSystemPrompt(libraryDigest),
       cache_control: { type: "ephemeral", ttl: "1h" },
     },
   ];
@@ -333,13 +341,14 @@ export function buildMatchParams(
 export async function matchCandidateLLM(
   row: Record<string, string>,
   corrections: CorrectionExample[] = [],
+  libraryDigest = "",
 ): Promise<MatchResult> {
   const candidateText = buildCandidateText(row);
 
   const hardBlock = checkHardBlock(candidateText);
   if (hardBlock) return hardBlock;
 
-  let systemText = buildSystemPrompt();
+  let systemText = buildSystemPrompt(libraryDigest);
   if (corrections.length > 0) {
     systemText = `${systemText}\n\n${buildCorrectionsBlock(corrections)}`;
   }

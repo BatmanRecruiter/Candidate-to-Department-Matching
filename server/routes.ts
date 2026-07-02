@@ -1,14 +1,16 @@
 import type { Express } from "express";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
-import * as fs from "node:fs";
-import * as path from "node:path";
-import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { augmentRoleLibrary, type RoleLibraryJob } from "@shared/matcher";
 import { calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
 import { storage } from "./storage";
-import { runRoleSync, syncedRoleToLibraryJob } from "./role-sync";
+import { runRoleSync } from "./role-sync";
+import {
+  AUGMENTED_LIBRARY,
+  getCombinedLibrary,
+  getLibraryDigest,
+  invalidateRoleLibraryCache,
+} from "./role-library";
 import {
   matchCandidateLLM,
   buildMatchParams,
@@ -17,56 +19,6 @@ import {
   type CorrectionExample,
 } from "./matcher-llm";
 import Anthropic from "@anthropic-ai/sdk";
-// Statically import the role library so esbuild bundles it into the
-// production server build. The dev server also reads the file from disk as a
-// fallback so regenerating the JSON without restarting works.
-import BUNDLED_LIBRARY from "../shared/role-library.json";
-
-function _dirname(): string {
-  try {
-    // CJS at runtime
-    // @ts-ignore
-    if (typeof __dirname !== "undefined") return __dirname as unknown as string;
-  } catch {}
-  try {
-    return path.dirname(fileURLToPath(import.meta.url));
-  } catch {
-    return process.cwd();
-  }
-}
-
-// Read the role library JSON once at startup. We bundle a snapshot under
-// shared/role-library.json. The build script (scripts/build-role-library.ts)
-// regenerates it from the source .txt files.
-function loadLibrary(): { generated_at: string; jobs: RoleLibraryJob[] } {
-  const candidates = [
-    path.resolve(process.cwd(), "shared/role-library.json"),
-    path.resolve(_dirname(), "../shared/role-library.json"),
-    path.resolve(_dirname(), "../../shared/role-library.json"),
-  ];
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p)) {
-        return JSON.parse(fs.readFileSync(p, "utf-8"));
-      }
-    } catch {}
-  }
-  // Fallback: the bundled snapshot baked into the build.
-  if (BUNDLED_LIBRARY && Array.isArray((BUNDLED_LIBRARY as any).jobs)) {
-    return BUNDLED_LIBRARY as { generated_at: string; jobs: RoleLibraryJob[] };
-  }
-  console.warn("[role-library] could not find role-library.json");
-  return { generated_at: new Date().toISOString(), jobs: [] };
-}
-
-const LIBRARY = loadLibrary();
-const AUGMENTED_LIBRARY = {
-  ...LIBRARY,
-  jobs: augmentRoleLibrary(LIBRARY.jobs),
-};
-console.log(
-  `[role-library] loaded ${AUGMENTED_LIBRARY.jobs.length} jobs (generated ${AUGMENTED_LIBRARY.generated_at})`,
-);
 
 const ADMIN_PASSCODE_HASH = process.env.ADMIN_PASSCODE_HASH;
 const SHARED_HISTORY_HASH = "shared-admin-history";
@@ -150,33 +102,9 @@ export async function registerRoutes(
   httpServer: Server,
   app: Express,
 ): Promise<Server> {
-  // Combine the bundled (historical) library with any active synced roles,
-  // deduped by job_id. Bundled roles win on ID conflict so historical context
-  // is preserved exactly as-shipped.
-  async function buildCombinedLibrary(): Promise<{
-    generated_at: string;
-    jobs: RoleLibraryJob[];
-    bundled_count: number;
-    synced_count: number;
-  }> {
-    const synced = await storage.listSyncedRoles(true);
-    const bundledIds = new Set(AUGMENTED_LIBRARY.jobs.map((j) => j.job_id).filter(Boolean));
-    const additions: RoleLibraryJob[] = [];
-    for (const row of synced) {
-      if (bundledIds.has(row.jobId)) continue;
-      additions.push(syncedRoleToLibraryJob(row));
-    }
-    return {
-      generated_at: AUGMENTED_LIBRARY.generated_at,
-      jobs: [...AUGMENTED_LIBRARY.jobs, ...additions],
-      bundled_count: AUGMENTED_LIBRARY.jobs.length,
-      synced_count: additions.length,
-    };
-  }
-
   app.get("/api/role-library", async (_req, res, next) => {
     try {
-      const combined = await buildCombinedLibrary();
+      const combined = await getCombinedLibrary();
       res.json({
         generated_at: combined.generated_at,
         jobs: combined.jobs,
@@ -188,12 +116,13 @@ export async function registerRoutes(
 
   app.get("/api/health", async (_req, res, next) => {
     try {
-      const combined = await buildCombinedLibrary();
+      const combined = await getCombinedLibrary();
       res.json({
         ok: true,
         jobs: combined.jobs.length,
         bundled_jobs: combined.bundled_count,
         synced_jobs: combined.synced_count,
+        synced_active_jobs: combined.synced_active_count,
       });
     } catch (err) {
       next(err);
@@ -221,6 +150,8 @@ export async function registerRoutes(
     try {
       if (!requireAdmin(req, res)) return;
       const result = await runRoleSync("manual");
+      // Even a partial/errored run may have upserted rows — always refresh.
+      invalidateRoleLibraryCache();
       const httpStatus = result.status === "error" ? 502 : 200;
       res.status(httpStatus).json(result);
     } catch (err) {
@@ -234,6 +165,7 @@ export async function registerRoutes(
     try {
       if (!requireAdmin(req, res)) return;
       const result = await runRoleSync("automated");
+      invalidateRoleLibraryCache();
       const httpStatus = result.status === "error" ? 502 : 200;
       res.status(httpStatus).json(result);
     } catch (err) {
@@ -313,7 +245,8 @@ export async function registerRoutes(
         correctedDepartment: c.correctedDepartment,
         feedbackReason: c.feedbackReason,
       }));
-      const result = await matchCandidateLLM(row, corrections);
+      const libraryDigest = await getLibraryDigest();
+      const result = await matchCandidateLLM(row, corrections, libraryDigest);
       res.json(result);
     } catch (err) {
       next(err);
@@ -400,6 +333,7 @@ export async function registerRoutes(
         feedbackReason: c.feedbackReason,
       }));
 
+      const libraryDigest = await getLibraryDigest();
       const batchClient = new Anthropic();
       const batchRequests: Array<{ custom_id: string; params: unknown }> = [];
       const preResolved: Record<number, unknown> = {};
@@ -415,7 +349,7 @@ export async function registerRoutes(
         } else {
           batchRequests.push({
             custom_id: `candidate-${i}`,
-            params: buildMatchParams(rows[i], corrections),
+            params: buildMatchParams(rows[i], corrections, libraryDigest),
           });
         }
       }
