@@ -14,11 +14,13 @@ export async function apiRequest(
   url: string,
   data?: unknown | undefined,
   headers?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<Response> {
   const res = await fetch(`${API_BASE}${url}`, {
     method,
     headers: { ...(data ? { "Content-Type": "application/json" } : {}), ...(headers || {}) },
     body: data ? JSON.stringify(data) : undefined,
+    signal,
   });
 
   await throwIfResNotOk(res);

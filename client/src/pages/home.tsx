@@ -35,6 +35,7 @@ import {
   SlidersHorizontal,
   LockKeyhole,
   Eye,
+  Square,
 } from "lucide-react";
 import { PhDataMark } from "@/components/logo";
 import { parseCsvText, rowsToCsv } from "@/lib/csv";
@@ -104,6 +105,17 @@ export default function Home() {
   const [dragOver, setDragOver] = useState(false);
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
+  // Stop support for a real-time run: the flag halts the chunk loop, the
+  // AbortController kills the requests already in flight.
+  const [stopping, setStopping] = useState(false);
+  const stopRequestedRef = useRef(false);
+  const runAbortRef = useRef<AbortController | null>(null);
+
+  const requestStopRun = useCallback(() => {
+    stopRequestedRef.current = true;
+    setStopping(true);
+    runAbortRef.current?.abort();
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [state, setState] = useState<ProcessedState | null>(null);
   const [adminPasscode, setAdminPasscode] = useState("");
@@ -237,7 +249,7 @@ export default function Home() {
     submittedAt: number;
     csvText: string;
     preResolved: Record<number, MatchResult>;
-    status: "pending" | "complete" | "error";
+    status: "pending" | "complete" | "error" | "canceled";
   }
 
   const [batchMode, setBatchMode] = useState(false);
@@ -250,6 +262,7 @@ export default function Home() {
   });
   const [checkingBatch, setCheckingBatch] = useState<string | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState<string | null>(null);
+  const [cancelingBatch, setCancelingBatch] = useState<string | null>(null);
 
   const saveBatchJobs = useCallback(
     (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
@@ -417,6 +430,41 @@ export default function Home() {
     [fetchBatchResults, toast],
   );
 
+  const cancelBatchJob = useCallback(
+    async (job: StoredBatchJob) => {
+      const passcode = adminPasscode.trim();
+      if (!passcode || !job.batchId) return;
+      setCancelingBatch(job.id);
+      try {
+        await apiRequest(
+          "POST",
+          `/api/match/batch/${job.batchId}/cancel`,
+          undefined,
+          { "x-admin-passcode": passcode },
+        );
+        saveBatchJobs((prev) =>
+          prev.map((j) =>
+            j.id === job.id ? { ...j, status: "canceled" as const } : j,
+          ),
+        );
+        toast({
+          title: "Batch canceled",
+          description: `${job.fileName} was stopped. Its results will not be loaded.`,
+        });
+      } catch {
+        toast({
+          title: "Cancel failed",
+          description:
+            "Could not cancel the batch job — it may have already finished.",
+          variant: "destructive",
+        });
+      } finally {
+        setCancelingBatch(null);
+      }
+    },
+    [adminPasscode, saveBatchJobs, toast],
+  );
+
   // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
   useEffect(() => {
     const passcode = adminPasscode.trim();
@@ -451,6 +499,10 @@ export default function Home() {
       setProcessing(true);
       setProgress(0);
       setState(null);
+      stopRequestedRef.current = false;
+      setStopping(false);
+      const runAbort = new AbortController();
+      runAbortRef.current = runAbort;
       try {
         const text = await file.text();
         const { headers, rows } = parseCsvText(text);
@@ -477,11 +529,18 @@ export default function Home() {
         let completed = 0;
         const CONCURRENCY = 5;
         for (let i = 0; i < rows.length; i += CONCURRENCY) {
+          if (stopRequestedRef.current) throw new Error("__run_stopped__");
           const chunk = rows.slice(i, Math.min(i + CONCURRENCY, rows.length));
           await Promise.all(
             chunk.map(async (r, offset) => {
               const idx = i + offset;
-              const matchRes = await apiRequest("POST", "/api/match", { row: r });
+              const matchRes = await apiRequest(
+                "POST",
+                "/api/match",
+                { row: r },
+                undefined,
+                runAbort.signal,
+              );
               const baseMatch = (await matchRes.json()) as MatchResult;
               const m = applyCalibrationResponse(
                 baseMatch,
@@ -549,14 +608,25 @@ export default function Home() {
           description: `Scored ${rows.length} candidates for departmental alignment.`,
         });
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "Failed to parse CSV";
-        setError(msg);
-        toast({
-          title: "Could not process CSV",
-          description: msg,
-          variant: "destructive",
-        });
+        if (stopRequestedRef.current) {
+          // User hit Stop: discard partial results, save nothing.
+          toast({
+            title: "Run stopped",
+            description:
+              "Scoring halted. Partial results were discarded and nothing was saved.",
+          });
+        } else {
+          const msg = e instanceof Error ? e.message : "Failed to parse CSV";
+          setError(msg);
+          toast({
+            title: "Could not process CSV",
+            description: msg,
+            variant: "destructive",
+          });
+        }
       } finally {
+        runAbortRef.current = null;
+        setStopping(false);
         setProcessing(false);
       }
     },
@@ -955,36 +1025,61 @@ export default function Home() {
                             {new Date(job.submittedAt).toLocaleString()}
                           </span>
                           <div className="flex items-center gap-1.5">
-                            {job.batchId && (
-                              <Button
-                                size="sm"
-                                variant="outline"
-                                className="h-6 px-2 text-[10px]"
-                                onClick={() => checkBatchJob(job)}
-                                disabled={checkingBatch === job.id}
-                              >
-                                {checkingBatch === job.id ? (
-                                  <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                                ) : (
-                                  <RefreshCw className="mr-1 h-3 w-3" />
+                            {job.status === "canceled" ? (
+                              <span className="text-[10px] font-mono text-muted-foreground">
+                                canceled
+                              </span>
+                            ) : (
+                              <>
+                                {job.batchId && job.status === "pending" && (
+                                  <Button
+                                    size="sm"
+                                    variant="destructive"
+                                    className="h-6 px-2 text-[10px]"
+                                    onClick={() => cancelBatchJob(job)}
+                                    disabled={cancelingBatch === job.id}
+                                    data-testid={`button-cancel-batch-${job.id}`}
+                                  >
+                                    {cancelingBatch === job.id ? (
+                                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <Square className="mr-1 h-3 w-3" />
+                                    )}
+                                    {cancelingBatch === job.id ? "Canceling…" : "Cancel"}
+                                  </Button>
                                 )}
-                                {checkingBatch === job.id ? "Checking…" : "Check & Load"}
-                              </Button>
+                                {job.batchId && (
+                                  <Button
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-6 px-2 text-[10px]"
+                                    onClick={() => checkBatchJob(job)}
+                                    disabled={checkingBatch === job.id}
+                                  >
+                                    {checkingBatch === job.id ? (
+                                      <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                    ) : (
+                                      <RefreshCw className="mr-1 h-3 w-3" />
+                                    )}
+                                    {checkingBatch === job.id ? "Checking…" : "Check & Load"}
+                                  </Button>
+                                )}
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-6 px-2 text-[10px]"
+                                  onClick={() => downloadBatchJob(job)}
+                                  disabled={downloadingBatch === job.id}
+                                >
+                                  {downloadingBatch === job.id ? (
+                                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+                                  ) : (
+                                    <Download className="mr-1 h-3 w-3" />
+                                  )}
+                                  {downloadingBatch === job.id ? "…" : "Download"}
+                                </Button>
+                              </>
                             )}
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="h-6 px-2 text-[10px]"
-                              onClick={() => downloadBatchJob(job)}
-                              disabled={downloadingBatch === job.id}
-                            >
-                              {downloadingBatch === job.id ? (
-                                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                              ) : (
-                                <Download className="mr-1 h-3 w-3" />
-                              )}
-                              {downloadingBatch === job.id ? "…" : "Download"}
-                            </Button>
                           </div>
                         </div>
                       </div>
@@ -1201,10 +1296,25 @@ export default function Home() {
                 <div className="mt-4" data-testid="status-processing">
                   <div className="flex items-center justify-between text-xs mb-2 font-mono">
                     <span className="flex items-center gap-2">
-                      <Loader2 className="h-3 w-3 animate-spin" /> scoring
-                      candidates…
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                      {stopping ? "stopping…" : "scoring candidates…"}
                     </span>
-                    <span>{progress}%</span>
+                    <span className="flex items-center gap-2">
+                      {progress}%
+                      {!batchMode && (
+                        <Button
+                          size="sm"
+                          variant="destructive"
+                          className="h-6 px-2 text-[10px]"
+                          onClick={requestStopRun}
+                          disabled={stopping}
+                          data-testid="button-stop-run"
+                        >
+                          <Square className="mr-1 h-3 w-3" />
+                          {stopping ? "Stopping…" : "Stop"}
+                        </Button>
+                      )}
+                    </span>
                   </div>
                   <Progress value={progress} />
                 </div>
