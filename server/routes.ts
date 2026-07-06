@@ -14,6 +14,7 @@ import {
 import {
   matchCandidateLLM,
   buildMatchParams,
+  buildBatchSystemBlocks,
   checkHardBlock,
   processMatchContent,
   type CorrectionExample,
@@ -308,21 +309,37 @@ export async function registerRoutes(
   });
 
   // --- Batch API endpoints ---
+  // Pre-flight cost guard: batch submissions are two-phase. A request without
+  // confirmCost:true returns a USD estimate and creates NOTHING; the client
+  // shows the estimate, gets explicit confirmation, and resends with
+  // confirmCost:true. Rates are USD per million tokens for claude-sonnet-5 at
+  // the 50% Batch API discount (intro pricing through 2026-08-31: $2/$10 list
+  // -> $1/$5 batched). Estimates are labeled as such — chars/3.6 per token is
+  // deliberately conservative (overestimates slightly).
+  const BATCH_INPUT_USD_PER_MTOK = 1.0;
+  const BATCH_OUTPUT_USD_PER_MTOK = 5.0;
+  const EST_OUTPUT_TOKENS_PER_ROW = 250; // max_tokens is 512; rationales run ~150-300
+  const MAX_BATCH_ROWS = 500; // also bounds request-payload memory (see OOM note below)
+  const estimateTokens = (chars: number) => Math.ceil(chars / 3.6);
+
   // Accepts parsed candidate rows, submits them to the Anthropic Batch API
   // (50% cost vs real-time), and returns the Anthropic batch ID immediately.
   // Hard-block candidates are resolved instantly and returned alongside the ID.
   app.post("/api/match/batch", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
-      const { rows, fileName } = req.body as {
+      const { rows, fileName, confirmCost } = req.body as {
         rows: Record<string, string>[];
         fileName: string;
+        confirmCost?: boolean;
       };
       if (!Array.isArray(rows) || rows.length === 0) {
         return res.status(400).json({ message: "rows must be a non-empty array" });
       }
-      if (rows.length > 2000) {
-        return res.status(400).json({ message: "Maximum 2000 rows per batch" });
+      if (rows.length > MAX_BATCH_ROWS) {
+        return res
+          .status(400)
+          .json({ message: `Maximum ${MAX_BATCH_ROWS} rows per batch` });
       }
 
       const rawCorrections = await storage.listCorrections();
@@ -334,9 +351,14 @@ export async function registerRoutes(
       }));
 
       const libraryDigest = await getLibraryDigest();
+      // Built ONCE per batch and shared by reference across all rows. Never
+      // rebuild the prompt per row: 2000 copies of a multi-KB string is what
+      // put the 512MB Render instance out of memory.
+      const systemBlocks = buildBatchSystemBlocks(corrections, libraryDigest);
       const batchClient = new Anthropic();
       const batchRequests: Array<{ custom_id: string; params: unknown }> = [];
       const preResolved: Record<number, unknown> = {};
+      let candidateChars = 0;
 
       for (let i = 0; i < rows.length; i++) {
         const candidateText = Object.entries(rows[i])
@@ -347,9 +369,10 @@ export async function registerRoutes(
         if (hardBlock) {
           preResolved[i] = hardBlock;
         } else {
+          candidateChars += candidateText.length;
           batchRequests.push({
             custom_id: `candidate-${i}`,
-            params: buildMatchParams(rows[i], corrections, libraryDigest),
+            params: buildMatchParams(rows[i], systemBlocks),
           });
         }
       }
@@ -364,6 +387,38 @@ export async function registerRoutes(
         });
       }
 
+      // Cost estimate: hard-blocked rows are free; every other row pays the
+      // full system prompt (no caching on the batch path) plus its own text.
+      const llmRows = batchRequests.length;
+      const systemChars = systemBlocks.reduce((n, b) => n + b.text.length, 0);
+      const systemTokens = estimateTokens(systemChars);
+      const estimatedInputTokens =
+        llmRows * systemTokens + estimateTokens(candidateChars);
+      const estimatedOutputTokens = llmRows * EST_OUTPUT_TOKENS_PER_ROW;
+      const estimatedCostUsd =
+        (estimatedInputTokens * BATCH_INPUT_USD_PER_MTOK +
+          estimatedOutputTokens * BATCH_OUTPUT_USD_PER_MTOK) /
+        1_000_000;
+
+      if (confirmCost !== true) {
+        // Phase 1: estimate only. Nothing was submitted to Anthropic.
+        return res.json({
+          requiresConfirmation: true,
+          fileName,
+          rowCount: rows.length,
+          llmRows,
+          systemTokens,
+          estimatedInputTokens,
+          estimatedCostUsd,
+        });
+      }
+
+      console.log(
+        `[batch-cost] ${fileName}: ${llmRows} LLM rows (${rows.length} total), ` +
+          `~${systemTokens} system tokens/row, ~${estimatedInputTokens} input tokens, ` +
+          `estimated ~$${estimatedCostUsd.toFixed(2)}`,
+      );
+
       const batch = await batchClient.messages.batches.create({
         requests: batchRequests as Parameters<
           typeof batchClient.messages.batches.create
@@ -376,6 +431,7 @@ export async function registerRoutes(
         preResolved,
         fileName,
         allPreResolved: false,
+        estimatedCostUsd,
       });
     } catch (err) {
       next(err);

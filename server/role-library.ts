@@ -193,6 +193,17 @@ interface DigestEntry {
 }
 
 // Pure + deterministic: fixed department order, sorted titles, no timestamps
+// Hard ceiling on how much of a stored summary the digest will carry. The
+// digest is paid per candidate in batch runs, so a runaway summary must not
+// be able to silently inflate every request. Deterministic truncation.
+const MAX_DIGEST_SUMMARY_CHARS = 220;
+
+function capSummary(text: string): string {
+  return text.length > MAX_DIGEST_SUMMARY_CHARS
+    ? `${text.slice(0, MAX_DIGEST_SUMMARY_CHARS - 1)}…`
+    : text;
+}
+
 // or counts. The string only changes when the library genuinely changes, so
 // the cached matching system prompt is only rebuilt after a real sync change.
 export function buildLibraryDigest(jobs: RoleLibraryJob[]): string {
@@ -213,7 +224,7 @@ export function buildLibraryDigest(jobs: RoleLibraryJob[]): string {
       bucket.set(deptKey, titles);
     }
     const current = job.is_active !== false;
-    const summary = job.summary?.trim() || fallbackSummaryLine(job);
+    const summary = capSummary(job.summary?.trim() || fallbackSummaryLine(job));
     const existing = titles.get(job.title);
     if (!existing) {
       titles.set(job.title, { title: job.title, current, summary });

@@ -8,9 +8,10 @@
  *   writes the summary back to the database.
  *
  * Idempotent: roles that already have a summary are skipped, so re-running
- * only fills gaps. Requires ANTHROPIC_API_KEY and DATABASE_URL.
+ * only fills gaps. Pass --regenerate to rewrite EVERY summary (use after
+ * changing the summarizer prompt). Requires ANTHROPIC_API_KEY and DATABASE_URL.
  *
- * Run with: npx tsx scripts/backfill-role-summaries.ts
+ * Run with: npx tsx scripts/backfill-role-summaries.ts [--regenerate]
  */
 import "dotenv/config";
 import * as fs from "node:fs";
@@ -21,6 +22,7 @@ import { storage } from "../server/storage";
 
 const LIBRARY_PATH = path.resolve(process.cwd(), "shared/role-library.json");
 const SUMMARIES_PATH = path.resolve(process.cwd(), "shared/role-summaries.json");
+const REGENERATE = process.argv.includes("--regenerate");
 
 if (!process.env.ANTHROPIC_API_KEY) {
   console.error("ANTHROPIC_API_KEY must be set to run this backfill");
@@ -48,7 +50,7 @@ async function main() {
   let bundledSkipped = 0;
   for (const job of jobs) {
     if (!job.job_id) continue;
-    if (summaries[job.job_id]) {
+    if (!REGENERATE && summaries[job.job_id]) {
       bundledSkipped++;
       continue;
     }
@@ -70,7 +72,7 @@ async function main() {
   let syncedNew = 0;
   let syncedSkipped = 0;
   for (const row of synced) {
-    if (row.summary) {
+    if (!REGENERATE && row.summary) {
       syncedSkipped++;
       continue;
     }
