@@ -20,6 +20,12 @@ import {
   MODEL as MATCH_MODEL,
   type CorrectionExample,
 } from "./matcher-llm";
+import {
+  getCorrectionsPromptBlock,
+  invalidateCorrectionRulesCache,
+  rebuildCorrectionRules,
+} from "./correction-rules";
+import { filterRowForMatching } from "@shared/match-columns";
 import Anthropic from "@anthropic-ai/sdk";
 
 const ADMIN_PASSCODE_HASH = process.env.ADMIN_PASSCODE_HASH;
@@ -98,6 +104,15 @@ Be direct and specific. This will be shared with a recruiter who will update the
     | { type: "text"; text: string }
     | undefined;
   return textBlock?.text ?? "Analysis could not be generated.";
+}
+
+// Flattens a candidate row into the key: value text the hard-block regexes
+// and the LLM prompt consume. Kept identical to the historical format.
+function rowToText(row: Record<string, string>): string {
+  return Object.entries(row)
+    .filter(([, v]) => String(v ?? "").trim().length > 0)
+    .map(([k, v]) => `${k}: ${String(v).slice(0, 3000)}`)
+    .join("\n");
 }
 
 export async function registerRoutes(
@@ -240,15 +255,22 @@ export async function registerRoutes(
       if (!row || typeof row !== "object" || Array.isArray(row)) {
         return res.status(400).json({ message: "row must be a plain object" });
       }
-      const rawCorrections = await storage.listCorrections();
-      const corrections: CorrectionExample[] = rawCorrections.map((c) => ({
-        candidateName: c.candidateName,
-        originalDepartment: c.originalDepartment,
-        correctedDepartment: c.correctedDepartment,
-        feedbackReason: c.feedbackReason,
-      }));
+      // Hard-block regexes scan ALL row text (not named columns), so an
+      // excluded column could carry a block signal. The scan is free regex —
+      // run it on the FULL row first; only the LLM payload is filtered.
+      const hardBlock = checkHardBlock(rowToText(row));
+      if (hardBlock) {
+        return res.json(hardBlock);
+      }
+      // Server-side allowlist (defense-in-depth — the client filters too):
+      // only match-relevant columns reach the LLM.
+      const { row: matchRow, dropped } = filterRowForMatching(row);
+      if (dropped > 0) {
+        console.log(`[match-columns] /api/match: dropped ${dropped} columns`);
+      }
+      const correctionsBlock = await getCorrectionsPromptBlock();
       const libraryDigest = await getLibraryDigest();
-      const result = await matchCandidateLLM(row, corrections, libraryDigest);
+      const result = await matchCandidateLLM(matchRow, correctionsBlock, libraryDigest);
       res.json(result);
     } catch (err) {
       next(err);
@@ -283,6 +305,16 @@ export async function registerRoutes(
       });
       const { historyKeyHash: _historyKeyHash, ...safeCalibration } = saved;
       res.status(201).json(safeCalibration);
+
+      if (isCorrection) {
+        // The recent-5 examples changed immediately; the distilled rules
+        // rebuild fire-and-forget (one Haiku call). Failure keeps the old
+        // rules — it must never affect the calibration write.
+        invalidateCorrectionRulesCache();
+        rebuildCorrectionRules().catch((err) => {
+          console.warn("[correction-rules] rebuild failed:", err);
+        });
+      }
 
       // Fire-and-forget: send Slack notification when corrections cross the tipping point.
       if (isCorrection && correctionCountBefore === TIPPING_POINT - 1) {
@@ -347,39 +379,41 @@ export async function registerRoutes(
           .json({ message: `Maximum ${MAX_BATCH_ROWS} rows per batch` });
       }
 
-      const rawCorrections = await storage.listCorrections();
-      const corrections: CorrectionExample[] = rawCorrections.map((c) => ({
-        candidateName: c.candidateName,
-        originalDepartment: c.originalDepartment,
-        correctedDepartment: c.correctedDepartment,
-        feedbackReason: c.feedbackReason,
-      }));
-
+      const correctionsBlock = await getCorrectionsPromptBlock();
       const libraryDigest = await getLibraryDigest();
       // Built ONCE per batch and shared by reference across all rows. Never
       // rebuild the prompt per row: 2000 copies of a multi-KB string is what
       // put the 512MB Render instance out of memory.
-      const systemBlocks = buildBatchSystemBlocks(corrections, libraryDigest);
+      const systemBlocks = buildBatchSystemBlocks(correctionsBlock, libraryDigest);
       const batchClient = new Anthropic();
       const batchRequests: Array<{ custom_id: string; params: unknown }> = [];
       const preResolved: Record<number, unknown> = {};
       let candidateChars = 0;
+      let droppedColumns = 0;
 
       for (let i = 0; i < rows.length; i++) {
-        const candidateText = Object.entries(rows[i])
-          .filter(([, v]) => String(v ?? "").trim().length > 0)
-          .map(([k, v]) => `${k}: ${String(v).slice(0, 3000)}`)
-          .join("\n");
-        const hardBlock = checkHardBlock(candidateText);
+        // Hard-block regexes scan ALL row text (not named columns), so an
+        // excluded column could carry a block signal. The scan is free regex —
+        // run it on the FULL row; only the LLM payload/estimate is filtered.
+        const hardBlock = checkHardBlock(rowToText(rows[i]));
         if (hardBlock) {
           preResolved[i] = hardBlock;
-        } else {
-          candidateChars += candidateText.length;
-          batchRequests.push({
-            custom_id: `candidate-${i}`,
-            params: buildMatchParams(rows[i], systemBlocks),
-          });
+          continue;
         }
+        // Server-side allowlist (defense-in-depth — the client filters too):
+        // applied before the cost estimate and the batch payload.
+        const { row: matchRow, dropped } = filterRowForMatching(rows[i]);
+        droppedColumns += dropped;
+        candidateChars += rowToText(matchRow).length;
+        batchRequests.push({
+          custom_id: `candidate-${i}`,
+          params: buildMatchParams(matchRow, systemBlocks),
+        });
+      }
+      if (droppedColumns > 0) {
+        console.log(
+          `[match-columns] ${fileName}: dropped ${droppedColumns} column values across ${rows.length} rows from the LLM payload`,
+        );
       }
 
       if (batchRequests.length === 0) {

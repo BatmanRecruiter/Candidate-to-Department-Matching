@@ -45,6 +45,7 @@ import {
   buildExportRow,
 } from "@/lib/export";
 import type { MatchResult, RoleLibraryJob } from "@shared/matcher";
+import { filterRowForMatching, hasNameColumn, isMatchRelevantHeader } from "@shared/match-columns";
 import { APPENDED_COLUMNS, COLUMN_TEMPLATE } from "@shared/template";
 import type { CalibrationSummary, SavedFileSummary } from "@shared/schema";
 
@@ -321,13 +322,34 @@ export default function Home() {
           rows: Record<string, string>[];
           estimatedCostUsd: number;
           llmRows: number;
+          droppedColumnCount: number;
         }[] = [];
         for (const file of files) {
           const csvText = await file.text();
-          const { rows } = parseCsvText(csvText);
+          const { headers, rows } = parseCsvText(csvText);
           if (rows.length === 0) throw new Error(`${file.name}: no rows detected in CSV.`);
           if (rows.length > 500) throw new Error(`${file.name}: batch limit is 500 rows.`);
-          const res = await apiRequest("POST", "/api/match/batch", { rows, fileName: file.name }, { "x-admin-passcode": passcode });
+          if (!hasNameColumn(headers)) {
+            console.warn(
+              `[match-columns] ⚠️ ${file.name}: NO name column detected (expected Name / Full Name / First Name / Last Name). Candidates will display as row numbers.`,
+            );
+            toast({
+              title: "⚠️ No name column detected",
+              description: `${file.name} has no Name/Full Name column. Scoring continues, but candidates will display as row numbers.`,
+              variant: "destructive",
+            });
+          }
+          // Only match-relevant columns are sent (and billed); local csvText
+          // keeps every column for exports and downloads.
+          const droppedHeaders = headers.filter((h) => !isMatchRelevantHeader(h));
+          if (droppedHeaders.length > 0) {
+            console.log(
+              `[match-columns] ${file.name}: dropping ${droppedHeaders.length} of ${headers.length} columns from LLM payload:`,
+              droppedHeaders,
+            );
+          }
+          const matchRows = rows.map((r) => filterRowForMatching(r).row);
+          const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: file.name }, { "x-admin-passcode": passcode });
           const data = await res.json() as BatchResponse;
           if (data.allPreResolved) {
             // Every row was hard-blocked — resolved for free, no confirmation needed.
@@ -337,18 +359,21 @@ export default function Home() {
           pending.push({
             file,
             csvText,
-            rows,
+            rows: matchRows,
             estimatedCostUsd: data.estimatedCostUsd ?? 0,
             llmRows: data.llmRows ?? rows.length,
+            droppedColumnCount: droppedHeaders.length,
           });
         }
 
         if (pending.length > 0) {
           const totalCost = pending.reduce((s, p) => s + p.estimatedCostUsd, 0);
           const totalRows = pending.reduce((s, p) => s + p.llmRows, 0);
+          const totalDropped = pending.reduce((s, p) => s + p.droppedColumnCount, 0);
           const ok = window.confirm(
             `Submit ${pending.length} file${pending.length === 1 ? "" : "s"} (${totalRows} candidates) for batch scoring?\n\n` +
-              `Estimated cost: ~$${totalCost.toFixed(2)} (Anthropic Batch API, no prompt caching).\n\n` +
+              `Estimated cost: ~$${totalCost.toFixed(2)} (Anthropic Batch API, no prompt caching).\n` +
+              `${totalDropped} irrelevant column${totalDropped === 1 ? "" : "s"} dropped from the LLM payload (details in console).\n\n` +
               `Nothing has been submitted yet. Cancel to submit nothing.`,
           );
           if (!ok) {
@@ -570,6 +595,26 @@ export default function Home() {
             ? latestCalibrationMap(await loadCalibrations(effectiveAdminPasscode))
             : new Map<string, CalibrationResponse>();
 
+        if (!hasNameColumn(headers)) {
+          console.warn(
+            `[match-columns] ⚠️ ${file.name}: NO name column detected (expected Name / Full Name / First Name / Last Name). Candidates will display as row numbers.`,
+          );
+          toast({
+            title: "⚠️ No name column detected",
+            description: `${file.name} has no Name/Full Name column. Scoring continues, but candidates will display as row numbers.`,
+            variant: "destructive",
+          });
+        }
+        // Only match-relevant columns ride in the LLM payload; the local
+        // full rows stay untouched for exports and calibration keys.
+        const droppedHeaders = headers.filter((h) => !isMatchRelevantHeader(h));
+        if (droppedHeaders.length > 0) {
+          console.log(
+            `[match-columns] ${file.name}: dropping ${droppedHeaders.length} of ${headers.length} columns from LLM payload:`,
+            droppedHeaders,
+          );
+        }
+
         // Send candidates to the server-side LLM matcher in parallel batches.
         let completed = 0;
         const CONCURRENCY = 5;
@@ -582,7 +627,7 @@ export default function Home() {
               const matchRes = await apiRequest(
                 "POST",
                 "/api/match",
-                { row: r },
+                { row: filterRowForMatching(r).row },
                 undefined,
                 runAbort.signal,
               );

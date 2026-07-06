@@ -155,24 +155,6 @@ CRITICAL OUTPUT FORMAT: Your ENTIRE response must be a single JSON object and NO
 Valid department values: "Data Engineering", "Analytics", "Machine Learning", "Advisory", "Business Architecture", "Managed Services", "PMO", "Sales", "Unsure / Not Enough Information", "Not a Match for phData", "Needs human review"`;
 }
 
-function buildCorrectionsBlock(corrections: CorrectionExample[]): string {
-  const examples = corrections
-    .map(
-      (c, i) =>
-        `[${i + 1}] ${c.candidateName || "Candidate"}\n` +
-        `    System routed to: ${c.originalDepartment}\n` +
-        `    Recruiter corrected to: ${c.correctedDepartment}\n` +
-        `    Recruiter note: ${c.feedbackReason?.trim() || "(no note provided)"}`,
-    )
-    .join("\n\n");
-
-  return `RECRUITER CORRECTION PATTERNS — ${corrections.length} confirmed misroutes. Weight these heavily when a new candidate fits a similar profile:
-
-${examples}
-
-Apply these patterns: if a new candidate resembles one of the above profiles, route them as the recruiter corrected, not as the system originally guessed.`;
-}
-
 function buildCandidateText(row: Record<string, string>): string {
   return Object.entries(row)
     .filter(([, v]) => String(v ?? "").trim().length > 0)
@@ -306,14 +288,14 @@ export type BatchSystemBlock = { type: "text"; text: string };
 // path. The 50% Batch API discount is the cost lever for batches; prompt
 // caching stays on the sequential real-time path only (matchCandidateLLM).
 export function buildBatchSystemBlocks(
-  corrections: CorrectionExample[],
+  correctionsBlock: string,
   libraryDigest: string,
 ): BatchSystemBlock[] {
   const blocks: BatchSystemBlock[] = [
     { type: "text", text: buildSystemPrompt(libraryDigest) },
   ];
-  if (corrections.length > 0) {
-    blocks.push({ type: "text", text: buildCorrectionsBlock(corrections) });
+  if (correctionsBlock.trim()) {
+    blocks.push({ type: "text", text: correctionsBlock });
   }
   return blocks;
 }
@@ -347,7 +329,7 @@ export function buildMatchParams(
 
 export async function matchCandidateLLM(
   row: Record<string, string>,
-  corrections: CorrectionExample[] = [],
+  correctionsBlock = "",
   libraryDigest = "",
 ): Promise<MatchResult> {
   const candidateText = buildCandidateText(row);
@@ -356,8 +338,8 @@ export async function matchCandidateLLM(
   if (hardBlock) return hardBlock;
 
   let systemText = buildSystemPrompt(libraryDigest);
-  if (corrections.length > 0) {
-    systemText = `${systemText}\n\n${buildCorrectionsBlock(corrections)}`;
+  if (correctionsBlock.trim()) {
+    systemText = `${systemText}\n\n${correctionsBlock}`;
   }
 
   const resp = await cachedMessage({

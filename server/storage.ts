@@ -1,7 +1,8 @@
-import { calibrations, savedFiles, syncedRoles, syncRuns, users } from '@shared/schema';
+import { calibrations, correctionRules, savedFiles, syncedRoles, syncRuns, users } from '@shared/schema';
 import type {
   Calibration,
   CalibrationSummary,
+  CorrectionRules,
   SavedFile,
   SavedFileSummary,
   SyncedRole,
@@ -29,6 +30,8 @@ export interface IStorage {
   countCalibrations(): Promise<number>;
   countCorrections(): Promise<number>;
   createCalibration(calibration: Calibration): Promise<Calibration>;
+  getCorrectionRules(): Promise<CorrectionRules | undefined>;
+  upsertCorrectionRules(rules: CorrectionRules): Promise<void>;
   listSyncedRoles(activeOnly?: boolean): Promise<SyncedRole[]>;
   upsertSyncedRole(
     role: SyncedRole,
@@ -144,6 +147,30 @@ export class DatabaseStorage implements IStorage {
   async countCalibrations(): Promise<number> {
     const [row] = await db.select({ value: count() }).from(calibrations);
     return row?.value ?? 0;
+  }
+
+  async getCorrectionRules(): Promise<CorrectionRules | undefined> {
+    const [row] = await db
+      .select()
+      .from(correctionRules)
+      .where(eq(correctionRules.id, "current"));
+    return row;
+  }
+
+  async upsertCorrectionRules(rules: CorrectionRules): Promise<void> {
+    const existing = await this.getCorrectionRules();
+    if (existing) {
+      await db
+        .update(correctionRules)
+        .set({
+          rulesText: rules.rulesText,
+          correctionCount: rules.correctionCount,
+          updatedAt: rules.updatedAt,
+        })
+        .where(eq(correctionRules.id, rules.id));
+      return;
+    }
+    await db.insert(correctionRules).values(rules);
   }
 
   async listSyncedRoles(activeOnly = false): Promise<SyncedRole[]> {
