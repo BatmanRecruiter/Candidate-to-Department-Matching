@@ -275,8 +275,12 @@ export default function Home() {
     [],
   );
 
-  const submitBatch = useCallback(
-    async (file: File) => {
+  // Two-phase submission with a pre-flight cost guard: every file is first
+  // sent for a server-side USD estimate (nothing is submitted), then ONE
+  // confirmation dialog shows the total before anything is queued at
+  // Anthropic. Declining submits nothing.
+  const submitBatchFiles = useCallback(
+    async (files: File[]) => {
       const passcode = adminPasscode.trim();
       if (!passcode) {
         toast({ title: "Admin passcode required", description: "Enter the admin passcode to submit a batch job.", variant: "destructive" });
@@ -286,32 +290,82 @@ export default function Home() {
       setProcessing(true);
       setProgress(0);
       try {
-        const csvText = await file.text();
-        const { rows } = parseCsvText(csvText);
-        if (rows.length === 0) throw new Error("No rows detected in CSV.");
-        if (rows.length > 2000) throw new Error("Batch limit is 2000 rows.");
-
-        const res = await apiRequest("POST", "/api/match/batch", { rows, fileName: file.name }, { "x-admin-passcode": passcode });
-        const data = await res.json() as {
+        interface BatchResponse {
           batchId: string | null;
           rowCount: number;
           preResolved: Record<number, MatchResult>;
           fileName: string;
           allPreResolved: boolean;
+          requiresConfirmation?: boolean;
+          estimatedCostUsd?: number;
+          llmRows?: number;
+        }
+        const saveJob = (file: File, csvText: string, data: BatchResponse) => {
+          const job: StoredBatchJob = {
+            id: crypto.randomUUID(),
+            batchId: data.batchId,
+            fileName: file.name,
+            rowCount: data.rowCount,
+            submittedAt: Date.now(),
+            csvText,
+            preResolved: data.preResolved ?? {},
+            status: "pending",
+          };
+          saveBatchJobs((prev) => [job, ...prev]);
         };
 
-        const job: StoredBatchJob = {
-          id: crypto.randomUUID(),
-          batchId: data.batchId,
-          fileName: file.name,
-          rowCount: data.rowCount,
-          submittedAt: Date.now(),
-          csvText,
-          preResolved: data.preResolved ?? {},
-          status: "pending",
-        };
-        saveBatchJobs((prev) => [job, ...prev]);
-        toast({ title: "Batch submitted", description: `${data.rowCount} candidates queued. Results will auto-load when ready.` });
+        // Phase 1: parse + estimate every file. NOTHING is submitted here.
+        const pending: {
+          file: File;
+          csvText: string;
+          rows: Record<string, string>[];
+          estimatedCostUsd: number;
+          llmRows: number;
+        }[] = [];
+        for (const file of files) {
+          const csvText = await file.text();
+          const { rows } = parseCsvText(csvText);
+          if (rows.length === 0) throw new Error(`${file.name}: no rows detected in CSV.`);
+          if (rows.length > 500) throw new Error(`${file.name}: batch limit is 500 rows.`);
+          const res = await apiRequest("POST", "/api/match/batch", { rows, fileName: file.name }, { "x-admin-passcode": passcode });
+          const data = await res.json() as BatchResponse;
+          if (data.allPreResolved) {
+            // Every row was hard-blocked — resolved for free, no confirmation needed.
+            saveJob(file, csvText, data);
+            continue;
+          }
+          pending.push({
+            file,
+            csvText,
+            rows,
+            estimatedCostUsd: data.estimatedCostUsd ?? 0,
+            llmRows: data.llmRows ?? rows.length,
+          });
+        }
+
+        if (pending.length > 0) {
+          const totalCost = pending.reduce((s, p) => s + p.estimatedCostUsd, 0);
+          const totalRows = pending.reduce((s, p) => s + p.llmRows, 0);
+          const ok = window.confirm(
+            `Submit ${pending.length} file${pending.length === 1 ? "" : "s"} (${totalRows} candidates) for batch scoring?\n\n` +
+              `Estimated cost: ~$${totalCost.toFixed(2)} (Anthropic Batch API, no prompt caching).\n\n` +
+              `Nothing has been submitted yet. Cancel to submit nothing.`,
+          );
+          if (!ok) {
+            toast({ title: "Batch not submitted", description: "No files were sent to Anthropic." });
+            return;
+          }
+          // Phase 2: confirmed — actually submit each file.
+          for (const p of pending) {
+            const res = await apiRequest("POST", "/api/match/batch", { rows: p.rows, fileName: p.file.name, confirmCost: true }, { "x-admin-passcode": passcode });
+            const data = await res.json() as BatchResponse;
+            saveJob(p.file, p.csvText, data);
+          }
+          toast({
+            title: "Batch submitted",
+            description: `${pending.length} file${pending.length === 1 ? "" : "s"} queued (~$${totalCost.toFixed(2)} estimated). Results will auto-load when ready.`,
+          });
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : "Batch submission failed.");
       } finally {
@@ -319,15 +373,6 @@ export default function Home() {
       }
     },
     [adminPasscode, saveBatchJobs, toast],
-  );
-
-  const submitBatchFiles = useCallback(
-    async (files: File[]) => {
-      for (const file of files) {
-        await submitBatch(file);
-      }
-    },
-    [submitBatch],
   );
 
   // Fetches (or reads pre-resolved) results for one batch job and builds its

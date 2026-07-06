@@ -296,12 +296,33 @@ export function processMatchContent(
   };
 }
 
-// Builds the params object for a single candidate match request. Used directly
-// for real-time calls and as the inner params for each Anthropic batch request.
-export function buildMatchParams(
-  row: Record<string, string>,
+export type BatchSystemBlock = { type: "text"; text: string };
+
+// System blocks for a batch run: built ONCE per batch and shared by reference
+// across every row — rebuilding the multi-KB prompt string per row is what
+// ran the server out of memory. Deliberately NO cache_control here: batch
+// requests fan out in parallel, so cache reads rarely land while 1h-TTL cache
+// writes bill at 2x base input — the marker costs more than it saves on this
+// path. The 50% Batch API discount is the cost lever for batches; prompt
+// caching stays on the sequential real-time path only (matchCandidateLLM).
+export function buildBatchSystemBlocks(
   corrections: CorrectionExample[],
   libraryDigest: string,
+): BatchSystemBlock[] {
+  const blocks: BatchSystemBlock[] = [
+    { type: "text", text: buildSystemPrompt(libraryDigest) },
+  ];
+  if (corrections.length > 0) {
+    blocks.push({ type: "text", text: buildCorrectionsBlock(corrections) });
+  }
+  return blocks;
+}
+
+// Builds the params object for one candidate's batch request, reusing the
+// shared system blocks from buildBatchSystemBlocks.
+export function buildMatchParams(
+  row: Record<string, string>,
+  systemBlocks: BatchSystemBlock[],
 ): {
   model: string;
   max_tokens: number;
@@ -310,20 +331,6 @@ export function buildMatchParams(
   messages: Array<{ role: string; content: string }>;
 } {
   const candidateText = buildCandidateText(row);
-  const systemBlocks: Array<{
-    type: "text";
-    text: string;
-    cache_control?: { type: "ephemeral" };
-  }> = [
-    {
-      type: "text",
-      text: buildSystemPrompt(libraryDigest),
-      cache_control: { type: "ephemeral", ttl: "1h" },
-    },
-  ];
-  if (corrections.length > 0) {
-    systemBlocks.push({ type: "text", text: buildCorrectionsBlock(corrections) });
-  }
   return {
     model: MODEL,
     max_tokens: 512,

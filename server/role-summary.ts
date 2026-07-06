@@ -7,7 +7,9 @@ import { cachedMessage } from "./anthropicClient";
 const SUMMARY_MODEL = "claude-haiku-4-5";
 const MAX_BODY_CHARS = 6000;
 
-const SUMMARY_SYSTEM = `You summarize job postings for an internal recruiting tool. Given one posting, reply with 1-2 plain-text sentences: first the core responsibilities of the role, then the key qualifications (years of experience, must-have skills, seniority level). No preamble, no markdown, no quotes — output only the sentences.`;
+// Keep summaries SHORT: every one of them rides inside the matching prompt
+// for every candidate, so each extra word here is paid per candidate scored.
+const SUMMARY_SYSTEM = `You compress job postings for an internal recruiting tool. Given one posting, reply with ONE telegraphic line of AT MOST 20 words covering: core function, required years of experience, and the 3-5 most important skills. Example format: "Builds Snowflake/Databricks pipelines for enterprise clients; 5+ yrs; Python, SQL, AWS." No preamble, no markdown — output only the line.`;
 
 export async function summarizeRole(
   title: string,
@@ -23,7 +25,7 @@ export async function summarizeRole(
       },
     ],
     model: SUMMARY_MODEL,
-    maxTokens: 250,
+    maxTokens: 60,
   });
   const textBlock = resp.content.find((b: { type: string }) => b.type === "text") as
     | { type: "text"; text: string }
