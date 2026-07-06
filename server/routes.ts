@@ -17,6 +17,7 @@ import {
   buildBatchSystemBlocks,
   checkHardBlock,
   processMatchContent,
+  MODEL as MATCH_MODEL,
   type CorrectionExample,
 } from "./matcher-llm";
 import Anthropic from "@anthropic-ai/sdk";
@@ -314,13 +315,17 @@ export async function registerRoutes(
   // shows the estimate, gets explicit confirmation, and resends with
   // confirmCost:true. Rates are USD per million tokens for claude-sonnet-5 at
   // the 50% Batch API discount (intro pricing through 2026-08-31: $2/$10 list
-  // -> $1/$5 batched). Estimates are labeled as such — chars/3.6 per token is
-  // deliberately conservative (overestimates slightly).
+  // -> $1/$5 batched). The system prompt (the dominant cost) is counted
+  // EXACTLY via the free count_tokens endpoint — this prompt tokenizes far
+  // denser than typical prose, so chars-based guesses under-report it. The
+  // chars/3 heuristic (which over-reports for prose) is used for candidate
+  // rows and as the fallback if count_tokens fails: a cost guard may
+  // overestimate, never underestimate.
   const BATCH_INPUT_USD_PER_MTOK = 1.0;
   const BATCH_OUTPUT_USD_PER_MTOK = 5.0;
   const EST_OUTPUT_TOKENS_PER_ROW = 250; // max_tokens is 512; rationales run ~150-300
   const MAX_BATCH_ROWS = 500; // also bounds request-payload memory (see OOM note below)
-  const estimateTokens = (chars: number) => Math.ceil(chars / 3.6);
+  const estimateTokens = (chars: number) => Math.ceil(chars / 3);
 
   // Accepts parsed candidate rows, submits them to the Anthropic Batch API
   // (50% cost vs real-time), and returns the Anthropic batch ID immediately.
@@ -390,8 +395,18 @@ export async function registerRoutes(
       // Cost estimate: hard-blocked rows are free; every other row pays the
       // full system prompt (no caching on the batch path) plus its own text.
       const llmRows = batchRequests.length;
-      const systemChars = systemBlocks.reduce((n, b) => n + b.text.length, 0);
-      const systemTokens = estimateTokens(systemChars);
+      let systemTokens: number;
+      try {
+        const counted = await batchClient.messages.countTokens({
+          model: MATCH_MODEL,
+          system: systemBlocks,
+          messages: [{ role: "user", content: "x" }],
+        });
+        systemTokens = counted.input_tokens;
+      } catch {
+        const systemChars = systemBlocks.reduce((n, b) => n + b.text.length, 0);
+        systemTokens = estimateTokens(systemChars);
+      }
       const estimatedInputTokens =
         llmRows * systemTokens + estimateTokens(candidateChars);
       const estimatedOutputTokens = llmRows * EST_OUTPUT_TOKENS_PER_ROW;

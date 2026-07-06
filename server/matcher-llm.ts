@@ -1,7 +1,7 @@
 import { cachedMessage } from "./anthropicClient";
 import { UNSURE, NOT_A_MATCH, HUMAN_REVIEW, type MatchResult } from "@shared/matcher";
 
-const MODEL = "claude-sonnet-5";
+export const MODEL = "claude-sonnet-5";
 
 // Hard blocks run before the LLM call to avoid burning tokens on clearly
 // out-of-scope profiles. These fire only on unambiguous signals.
