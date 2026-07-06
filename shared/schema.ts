@@ -66,6 +66,18 @@ export const syncRuns = pgTable("sync_runs", {
 export type SyncedRole = typeof syncedRoles.$inferSelect;
 export type SyncRun = typeof syncRuns.$inferSelect;
 
+// Single-row table ("current") holding the Haiku-distilled routing rules
+// derived from all recruiter corrections. Rebuilt when a correction lands —
+// never per request — so the prompt's corrections block stays bounded.
+export const correctionRules = pgTable("correction_rules", {
+  id: text("id").primaryKey(),
+  rulesText: text("rules_text").notNull(),
+  correctionCount: integer("correction_count").notNull(),
+  updatedAt: bigint("updated_at", { mode: "number" }).notNull(),
+});
+
+export type CorrectionRules = typeof correctionRules.$inferSelect;
+
 export const calibrations = pgTable("calibrations", {
   id: text("id").primaryKey(),
   historyKeyHash: text("history_key_hash").notNull(),
