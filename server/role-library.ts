@@ -238,18 +238,24 @@ export function buildLibraryDigest(jobs: RoleLibraryJob[]): string {
     }
   }
 
+  // Inactive roles can never be routed to — the model only needs to know the
+  // title existed, so their summary lines are dead weight paid on every
+  // candidate. Titles-only for historical entries; active entries keep their
+  // (220-char-capped) summary. Stored summaries are untouched — this changes
+  // rendering only, so a reactivated role gets its summary line back for free.
   const renderEntries = (titles: Map<string, DigestEntry>): string[] =>
     Array.from(titles.values())
       .sort((a, b) => (a.title < b.title ? -1 : a.title > b.title ? 1 : 0))
-      .map(
-        (e) =>
-          `- ${e.title}${e.current ? "" : " (no longer posted)"}: ${e.summary}`,
+      .map((e) =>
+        e.current
+          ? `- ${e.title}: ${e.summary}`
+          : `- ${e.title} (no longer posted)`,
       );
 
   const sections: string[] = [
     `## phData Role Library — actual roles phData has hired for (supplementary context)
 
-Real phData job postings, grouped by department, each with a summary of responsibilities and qualifications. Roles marked "(no longer posted)" are historical but remain valid evidence of the kind of work each department does. This list is SUPPLEMENTARY — the department definitions above are authoritative, and your output must still be one of the valid department values listed below.`,
+Real phData job postings, grouped by department. Active roles include a summary of responsibilities and qualifications; roles marked "(no longer posted)" are historical titles that remain valid evidence of the kind of work each department does. This list is SUPPLEMENTARY — the department definitions above are authoritative, and your output must still be one of the valid department values listed below.`,
   ];
 
   for (const dept of TAXONOMY_DEPARTMENTS) {
