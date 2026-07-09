@@ -328,7 +328,7 @@ export default function Home() {
           const csvText = await file.text();
           const { headers, rows } = parseCsvText(csvText);
           if (rows.length === 0) throw new Error(`${file.name}: no rows detected in CSV.`);
-          if (rows.length > 500) throw new Error(`${file.name}: batch limit is 500 rows.`);
+          if (rows.length > 1100) throw new Error(`${file.name}: batch limit is 1100 rows.`);
           if (!hasNameColumn(headers)) {
             console.warn(
               `[match-columns] ⚠️ ${file.name}: NO name column detected (expected Name / Full Name / First Name / Last Name). Candidates will display as row numbers.`,

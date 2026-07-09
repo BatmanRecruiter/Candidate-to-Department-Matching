@@ -356,7 +356,9 @@ export async function registerRoutes(
   const BATCH_INPUT_USD_PER_MTOK = 1.0;
   const BATCH_OUTPUT_USD_PER_MTOK = 5.0;
   const EST_OUTPUT_TOKENS_PER_ROW = 250; // max_tokens is 512; rationales run ~150-300
-  const MAX_BATCH_ROWS = 500; // also bounds request-payload memory (see OOM note below)
+  const MAX_BATCH_ROWS = 1100; // cost/memory bound. The per-row prompt-duplication OOM
+  // that justified the old 500 cap is fixed (systemBlocks is built once and shared by
+  // reference below); this ceiling caps worst-case batch spend (no cache on this path).
   const estimateTokens = (chars: number) => Math.ceil(chars / 3);
 
   // Accepts parsed candidate rows, submits them to the Anthropic Batch API
