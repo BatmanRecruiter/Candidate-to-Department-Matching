@@ -136,6 +136,10 @@ export async function registerRoutes(
       const combined = await getCombinedLibrary();
       res.json({
         ok: true,
+        // Which commit is actually live. Render injects RENDER_GIT_COMMIT on
+        // every deploy; lets a deploy be verified from outside without dashboard
+        // access. Falls back to "unknown" locally.
+        commit: (process.env.RENDER_GIT_COMMIT ?? process.env.GIT_COMMIT ?? "unknown").slice(0, 7),
         jobs: combined.jobs.length,
         bundled_jobs: combined.bundled_count,
         synced_jobs: combined.synced_count,
