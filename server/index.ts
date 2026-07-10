@@ -43,6 +43,7 @@ app.use(
     limit: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // Role sync hits an external Greenhouse endpoint; cap calls more tightly.
@@ -53,6 +54,7 @@ app.use(
     limit: 20,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // LLM match endpoint — each call hits the Anthropic API. 600/15 min = 40/min.
@@ -63,6 +65,7 @@ app.use(
     limit: 600,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // Batch submit/status — low limit since each submission can be thousands of rows.
@@ -73,6 +76,7 @@ app.use(
     limit: 20,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 
