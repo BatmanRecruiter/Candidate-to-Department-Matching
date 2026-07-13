@@ -11,21 +11,29 @@ const app = express();
 const httpServer = createServer(app);
 
 app.set("trust proxy", 1);
+// The production CSP is intentionally strict. In development it is disabled so
+// Vite's inline react-refresh preamble, the HMR websocket, and the Google Fonts
+// stylesheet can load (script-src 'self' otherwise blanks the dev page). This
+// is a LOCAL-TESTING unblock only — production (NODE_ENV=production, per the
+// start script) keeps the exact directives below, unchanged.
+const isProduction = process.env.NODE_ENV === "production";
 app.use(
   helmet({
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'"],
-        styleSrc: ["'self'", "'unsafe-inline'"],
-        fontSrc: ["'self'", "data:"],
-        imgSrc: ["'self'", "data:"],
-        connectSrc: ["'self'"],
-        objectSrc: ["'none'"],
-        baseUri: ["'self'"],
-        frameAncestors: ["'self'"],
-      },
-    },
+    contentSecurityPolicy: isProduction
+      ? {
+          directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            fontSrc: ["'self'", "data:"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'"],
+            objectSrc: ["'none'"],
+            baseUri: ["'self'"],
+            frameAncestors: ["'self'"],
+          },
+        }
+      : false,
   }),
 );
 app.use(
@@ -35,6 +43,7 @@ app.use(
     limit: 120,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // Role sync hits an external Greenhouse endpoint; cap calls more tightly.
@@ -45,6 +54,7 @@ app.use(
     limit: 20,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // LLM match endpoint — each call hits the Anthropic API. 600/15 min = 40/min.
@@ -55,6 +65,7 @@ app.use(
     limit: 600,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 // Batch submit/status — low limit since each submission can be thousands of rows.
@@ -65,6 +76,7 @@ app.use(
     limit: 20,
     standardHeaders: true,
     legacyHeaders: false,
+    skip: () => !isProduction,
   }),
 );
 
