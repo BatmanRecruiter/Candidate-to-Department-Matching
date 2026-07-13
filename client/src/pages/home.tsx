@@ -49,6 +49,24 @@ import { filterRowForMatching, hasNameColumn, isMatchRelevantHeader } from "@sha
 import { APPENDED_COLUMNS, COLUMN_TEMPLATE } from "@shared/template";
 import type { CalibrationSummary, SavedFileSummary } from "@shared/schema";
 
+// Batch-wide safety bounds for multi-file batch submission (per-file rows are
+// already capped at 1100). These cap the WHOLE drop so parsing many files can't
+// exhaust the browser tab's memory during the estimate phase and crash the
+// renderer — which recovers by silently reloading to an empty home screen.
+const MAX_BATCH_FILES = 30;
+const MAX_BATCH_TOTAL_ROWS = 15000;
+
+// Lightweight per-file record kept during the estimate phase: a File handle +
+// metadata only, never the parsed rows or csvText, so peak memory stays at
+// ~one file regardless of how many are dropped. The file is re-read at submit.
+interface PendingBatchFile {
+  file: File;
+  rowCount: number;
+  estimatedCostUsd: number;
+  llmRows: number;
+  droppedColumnCount: number;
+}
+
 interface LibraryResponse {
   generated_at: string;
   jobs: RoleLibraryJob[];
@@ -287,48 +305,60 @@ export default function Home() {
         toast({ title: "Admin passcode required", description: "Enter the admin passcode to submit a batch job.", variant: "destructive" });
         return;
       }
+      // Batch-wide guard applied BEFORE any file is read, so an oversized drop
+      // can't build a huge in-memory payload and crash the tab during Phase 1.
+      if (files.length > MAX_BATCH_FILES) {
+        toast({
+          title: `Too many files (${files.length})`,
+          description: `Submit at most ${MAX_BATCH_FILES} files per batch — split the drop into smaller groups.`,
+          variant: "destructive",
+        });
+        return;
+      }
       setError(null);
       setProcessing(true);
       setProgress(0);
-      try {
-        interface BatchResponse {
-          batchId: string | null;
-          rowCount: number;
-          preResolved: Record<number, MatchResult>;
-          fileName: string;
-          allPreResolved: boolean;
-          requiresConfirmation?: boolean;
-          estimatedCostUsd?: number;
-          llmRows?: number;
-        }
-        const saveJob = (file: File, csvText: string, data: BatchResponse) => {
-          const job: StoredBatchJob = {
-            id: crypto.randomUUID(),
-            batchId: data.batchId,
-            fileName: file.name,
-            rowCount: data.rowCount,
-            submittedAt: Date.now(),
-            csvText,
-            preResolved: data.preResolved ?? {},
-            status: "pending",
-          };
-          saveBatchJobs((prev) => [job, ...prev]);
-        };
 
-        // Phase 1: parse + estimate every file. NOTHING is submitted here.
-        const pending: {
-          file: File;
-          csvText: string;
-          rows: Record<string, string>[];
-          estimatedCostUsd: number;
-          llmRows: number;
-          droppedColumnCount: number;
-        }[] = [];
-        for (const file of files) {
+      interface BatchResponse {
+        batchId: string | null;
+        rowCount: number;
+        preResolved: Record<number, MatchResult>;
+        fileName: string;
+        allPreResolved: boolean;
+        requiresConfirmation?: boolean;
+        estimatedCostUsd?: number;
+        llmRows?: number;
+      }
+      const saveJob = (file: File, csvText: string, data: BatchResponse) => {
+        const job: StoredBatchJob = {
+          id: crypto.randomUUID(),
+          batchId: data.batchId,
+          fileName: file.name,
+          rowCount: data.rowCount,
+          submittedAt: Date.now(),
+          csvText,
+          preResolved: data.preResolved ?? {},
+          status: "pending",
+        };
+        saveBatchJobs((prev) => [job, ...prev]);
+      };
+
+      // Parse + estimate ONE file. Returns lightweight metadata only; csvText,
+      // rows and matchRows fall out of scope (and are GC'd) before the next file
+      // is read — this is the fix for the 19-file OOM. Wrapped so one bad file
+      // records a failure instead of aborting the whole batch.
+      const estimateFile = async (
+        file: File,
+      ): Promise<
+        | { kind: "pending"; pending: PendingBatchFile }
+        | { kind: "preResolved" }
+        | { kind: "error"; error: string }
+      > => {
+        try {
           const csvText = await file.text();
           const { headers, rows } = parseCsvText(csvText);
-          if (rows.length === 0) throw new Error(`${file.name}: no rows detected in CSV.`);
-          if (rows.length > 1100) throw new Error(`${file.name}: batch limit is 1100 rows.`);
+          if (rows.length === 0) return { kind: "error", error: `${file.name}: no rows detected in CSV.` };
+          if (rows.length > 1100) return { kind: "error", error: `${file.name}: batch limit is 1100 rows.` };
           if (!hasNameColumn(headers)) {
             console.warn(
               `[match-columns] ⚠️ ${file.name}: NO name column detected (expected Name / Full Name / First Name / Last Name). Candidates will display as row numbers.`,
@@ -354,45 +384,108 @@ export default function Home() {
           if (data.allPreResolved) {
             // Every row was hard-blocked — resolved for free, no confirmation needed.
             saveJob(file, csvText, data);
-            continue;
+            return { kind: "preResolved" };
           }
-          pending.push({
-            file,
-            csvText,
-            rows: matchRows,
-            estimatedCostUsd: data.estimatedCostUsd ?? 0,
-            llmRows: data.llmRows ?? rows.length,
-            droppedColumnCount: droppedHeaders.length,
+          return {
+            kind: "pending",
+            pending: {
+              file,
+              rowCount: rows.length,
+              estimatedCostUsd: data.estimatedCostUsd ?? 0,
+              llmRows: data.llmRows ?? rows.length,
+              droppedColumnCount: droppedHeaders.length,
+            },
+          };
+        } catch (err) {
+          return { kind: "error", error: err instanceof Error ? err.message : `${file.name}: estimate failed.` };
+        }
+      };
+
+      const pending: PendingBatchFile[] = [];
+      const failures: string[] = [];
+      try {
+        // Phase 1: estimate each file in turn. NOTHING is submitted here. A
+        // per-file failure is recorded and skipped; the rest continue.
+        let totalRows = 0;
+        for (let i = 0; i < files.length; i++) {
+          const result = await estimateFile(files[i]);
+          if (result.kind === "error") {
+            failures.push(result.error);
+          } else if (result.kind === "pending") {
+            totalRows += result.pending.rowCount;
+            if (totalRows > MAX_BATCH_TOTAL_ROWS) {
+              failures.push(
+                `Stopped at ${files[i].name}: batch exceeds ${MAX_BATCH_TOTAL_ROWS} total rows. Split into smaller drops.`,
+              );
+              break;
+            }
+            pending.push(result.pending);
+          }
+          setProgress(Math.round(((i + 1) / files.length) * 100));
+        }
+
+        if (failures.length > 0) {
+          toast({
+            title: `${failures.length} file${failures.length === 1 ? "" : "s"} skipped`,
+            description: failures.slice(0, 4).join(" · ") + (failures.length > 4 ? " · …" : ""),
+            variant: "destructive",
           });
         }
 
-        if (pending.length > 0) {
-          const totalCost = pending.reduce((s, p) => s + p.estimatedCostUsd, 0);
-          const totalRows = pending.reduce((s, p) => s + p.llmRows, 0);
-          const totalDropped = pending.reduce((s, p) => s + p.droppedColumnCount, 0);
-          const ok = window.confirm(
-            `Submit ${pending.length} file${pending.length === 1 ? "" : "s"} (${totalRows} candidates) for batch scoring?\n\n` +
-              `Estimated cost: ~$${totalCost.toFixed(2)} (Anthropic Batch API, no prompt caching).\n` +
-              `${totalDropped} irrelevant column${totalDropped === 1 ? "" : "s"} dropped from the LLM payload (details in console).\n\n` +
-              `Nothing has been submitted yet. Cancel to submit nothing.`,
-          );
-          if (!ok) {
-            toast({ title: "Batch not submitted", description: "No files were sent to Anthropic." });
-            return;
-          }
-          // Phase 2: confirmed — actually submit each file.
-          for (const p of pending) {
-            const res = await apiRequest("POST", "/api/match/batch", { rows: p.rows, fileName: p.file.name, confirmCost: true }, { "x-admin-passcode": passcode });
+        if (pending.length === 0) return;
+
+        const totalCost = pending.reduce((s, p) => s + p.estimatedCostUsd, 0);
+        const totalLlmRows = pending.reduce((s, p) => s + p.llmRows, 0);
+        const totalDropped = pending.reduce((s, p) => s + p.droppedColumnCount, 0);
+        const ok = window.confirm(
+          `Submit ${pending.length} file${pending.length === 1 ? "" : "s"} (${totalLlmRows} candidates) for batch scoring?\n\n` +
+            `Estimated cost: ~$${totalCost.toFixed(2)} (Anthropic Batch API, no prompt caching).\n` +
+            `${totalDropped} irrelevant column${totalDropped === 1 ? "" : "s"} dropped from the LLM payload (details in console).\n\n` +
+            `Nothing has been submitted yet. Cancel to submit nothing.`,
+        );
+        if (!ok) {
+          toast({ title: "Batch not submitted", description: "No files were sent to Anthropic." });
+          return;
+        }
+
+        // Phase 2: confirmed — re-read + re-parse each file at submit time so we
+        // never hold every file's rows in memory at once. Each submit is
+        // isolated; one failure doesn't abort the rest.
+        let submitted = 0;
+        const submitFailures: string[] = [];
+        for (const p of pending) {
+          try {
+            const csvText = await p.file.text();
+            const matchRows = parseCsvText(csvText).rows.map((r) => filterRowForMatching(r).row);
+            const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: p.file.name, confirmCost: true }, { "x-admin-passcode": passcode });
             const data = await res.json() as BatchResponse;
-            saveJob(p.file, p.csvText, data);
+            saveJob(p.file, csvText, data);
+            submitted++;
+          } catch (err) {
+            submitFailures.push(p.file.name);
+            console.error(`[batch] submit failed for ${p.file.name}:`, err);
           }
+        }
+
+        if (submitFailures.length > 0) {
+          toast({
+            title: `${submitFailures.length} submission${submitFailures.length === 1 ? "" : "s"} failed`,
+            description: `Not queued: ${submitFailures.join(", ")}. ${submitted} succeeded — retry the failed files.`,
+            variant: "destructive",
+          });
+        }
+        if (submitted > 0) {
           toast({
             title: "Batch submitted",
-            description: `${pending.length} file${pending.length === 1 ? "" : "s"} queued (~$${totalCost.toFixed(2)} estimated). Results will auto-load when ready.`,
+            description: `${submitted} file${submitted === 1 ? "" : "s"} queued (~$${totalCost.toFixed(2)} estimated). Results will auto-load when ready.`,
           });
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Batch submission failed.");
+        // Belt-and-suspenders: per-file work is already isolated, but a failure
+        // must never vanish silently and leave a reset-looking screen.
+        const msg = err instanceof Error ? err.message : "Batch submission failed.";
+        setError(msg);
+        toast({ title: "Batch submission failed", description: msg, variant: "destructive" });
       } finally {
         setProcessing(false);
       }
