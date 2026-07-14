@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
+import { batchJobPatchSchema, batchJobRequestSchema, calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
 import { storage } from "./storage";
 import { runRoleSync } from "./role-sync";
 import {
@@ -51,6 +51,7 @@ function requireAdmin(req: { header(name: string): string | undefined }, res: an
 
 const MAX_SAVED_FILES = 500;
 const MAX_CALIBRATIONS = 3000;
+const MAX_BATCH_JOBS = 2000;
 const TIPPING_POINT = 50;
 
 async function sendSlackNotification(text: string): Promise<void> {
@@ -244,6 +245,73 @@ export async function registerRoutes(
     }
   });
 
+  // Batch jobs — durable server-side record of submitted batches (the source of
+  // truth over the client's localStorage). List omits the big csvText/preResolved
+  // blobs; GET :id returns the full row and is only hit when rebuilding an export.
+  app.get("/api/batch-jobs", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      res.json(await storage.listBatchJobs());
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  app.get("/api/batch-jobs/:id", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const job = await storage.getBatchJob(req.params.id);
+      if (!job) return res.status(404).json({ message: "Batch job not found" });
+      res.json(job);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Client-initiated create — used for all-hard-blocked ("complete") jobs that
+  // never hit the Anthropic batch API. Billed jobs are created server-side by
+  // the /api/match/batch submit flow, not here.
+  app.post("/api/batch-jobs", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const parsed = batchJobRequestSchema.parse(req.body);
+      if ((await storage.countBatchJobs()) >= MAX_BATCH_JOBS) {
+        return res.status(429).json({
+          message: `Batch job limit reached (${MAX_BATCH_JOBS}).`,
+        });
+      }
+      const created = await storage.createBatchJob({
+        id: randomUUID(),
+        batchId: parsed.batchId ?? null,
+        status: parsed.status,
+        fileName: parsed.fileName,
+        rowCount: parsed.rowCount,
+        csvText: parsed.csvText,
+        preResolved: parsed.preResolved,
+        createdAt: Date.now(),
+      });
+      const { csvText: _csvText, preResolved: _preResolved, ...summary } = created;
+      res.status(201).json(summary);
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Client-driven status transitions only (complete | canceled | error). The
+  // submit flow mutates the row directly via storage, not through this route.
+  app.patch("/api/batch-jobs/:id", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const parsed = batchJobPatchSchema.parse(req.body);
+      const existing = await storage.getBatchJob(req.params.id);
+      if (!existing) return res.status(404).json({ message: "Batch job not found" });
+      await storage.updateBatchJob(req.params.id, { status: parsed.status });
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get("/api/calibrations", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
@@ -371,10 +439,11 @@ export async function registerRoutes(
   app.post("/api/match/batch", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
-      const { rows, fileName, confirmCost } = req.body as {
+      const { rows, fileName, confirmCost, csvText } = req.body as {
         rows: Record<string, string>[];
         fileName: string;
         confirmCost?: boolean;
+        csvText?: string; // full original CSV; required only on the confirmed submit
       };
       if (!Array.isArray(rows) || rows.length === 0) {
         return res.status(400).json({ message: "rows must be a non-empty array" });
@@ -474,13 +543,56 @@ export async function registerRoutes(
           `estimated ~$${estimatedCostUsd.toFixed(2)}`,
       );
 
+      // csvText is required on the confirmed submit so the batch_jobs row can
+      // rebuild exports without the client's localStorage.
+      if (typeof csvText !== "string" || csvText.length === 0 || csvText.length > 5_000_000) {
+        return res
+          .status(400)
+          .json({ message: "csvText (1..5,000,000 chars) is required to submit a batch" });
+      }
+      if ((await storage.countBatchJobs()) >= MAX_BATCH_JOBS) {
+        return res
+          .status(429)
+          .json({ message: `Batch job limit reached (${MAX_BATCH_JOBS}).` });
+      }
+
+      // Durable-record ordering: write the intent row BEFORE the billable
+      // Anthropic call, so a crash between create() and the id-update can never
+      // leave a billed batch with no server record. If create() throws, the
+      // "submitting" row is a harmless dangling record (nothing was billed) that
+      // reconciliation (Fix 4) can prune.
+      const jobId = randomUUID();
+      await storage.createBatchJob({
+        id: jobId,
+        batchId: null,
+        status: "submitting",
+        fileName,
+        rowCount: rows.length,
+        csvText,
+        preResolved: JSON.stringify(preResolved),
+        createdAt: Date.now(),
+      });
+
       const batch = await batchClient.messages.batches.create({
         requests: batchRequests as Parameters<
           typeof batchClient.messages.batches.create
         >[0]["requests"],
       });
 
+      // Reconcile the row with the real batch id. If this update throws after a
+      // successful create(), we still return batch.id and log — the row is
+      // recoverable by id/createdAt.
+      try {
+        await storage.updateBatchJob(jobId, { batchId: batch.id, status: "pending" });
+      } catch (updateErr) {
+        console.error(
+          `[batch] row ${jobId} created batch ${batch.id} but status update failed:`,
+          updateErr,
+        );
+      }
+
       res.json({
+        jobId,
         batchId: batch.id,
         rowCount: rows.length,
         preResolved,
