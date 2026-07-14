@@ -1,5 +1,7 @@
-import { calibrations, correctionRules, savedFiles, syncedRoles, syncRuns, users } from '@shared/schema';
+import { batchJobs, calibrations, correctionRules, savedFiles, syncedRoles, syncRuns, users } from '@shared/schema';
 import type {
+  BatchJob,
+  BatchJobSummary,
   Calibration,
   CalibrationSummary,
   CorrectionRules,
@@ -25,6 +27,14 @@ export interface IStorage {
   getSavedFile(id: string): Promise<SavedFile | undefined>;
   countSavedFiles(): Promise<number>;
   createSavedFile(file: SavedFile): Promise<SavedFile>;
+  listBatchJobs(): Promise<BatchJobSummary[]>;
+  getBatchJob(id: string): Promise<BatchJob | undefined>;
+  countBatchJobs(): Promise<number>;
+  createBatchJob(job: BatchJob): Promise<BatchJob>;
+  updateBatchJob(
+    id: string,
+    patch: Partial<Pick<BatchJob, "batchId" | "status">>,
+  ): Promise<void>;
   listCalibrations(): Promise<CalibrationSummary[]>;
   listCorrections(): Promise<CalibrationSummary[]>;
   countCalibrations(): Promise<number>;
@@ -88,6 +98,50 @@ export class DatabaseStorage implements IStorage {
   async countSavedFiles(): Promise<number> {
     const [row] = await db.select({ value: count() }).from(savedFiles);
     return row?.value ?? 0;
+  }
+
+  // Batch jobs. listBatchJobs mirrors listSavedFiles: an explicit column
+  // projection that OMITS the large csvText + preResolved blobs so the list
+  // endpoint never pays egress for them. getBatchJob returns the full row
+  // (incl. csvText) and is only hit when rebuilding an export.
+  async listBatchJobs(): Promise<BatchJobSummary[]> {
+    return db
+      .select({
+        id: batchJobs.id,
+        batchId: batchJobs.batchId,
+        status: batchJobs.status,
+        fileName: batchJobs.fileName,
+        rowCount: batchJobs.rowCount,
+        createdAt: batchJobs.createdAt,
+      })
+      .from(batchJobs)
+      .orderBy(desc(batchJobs.createdAt))
+      .limit(100);
+  }
+
+  async getBatchJob(id: string): Promise<BatchJob | undefined> {
+    const [row] = await db.select().from(batchJobs).where(eq(batchJobs.id, id));
+    return row;
+  }
+
+  async countBatchJobs(): Promise<number> {
+    const [row] = await db.select({ value: count() }).from(batchJobs);
+    return row?.value ?? 0;
+  }
+
+  async createBatchJob(job: BatchJob): Promise<BatchJob> {
+    const [row] = await db.insert(batchJobs).values(job).returning();
+    return row;
+  }
+
+  // Mirrors updateSyncedRoleSummary's update-set-where shape. Used by the submit
+  // flow to flip "submitting" -> "pending" with the real batch_id, and by the
+  // PATCH endpoint for client-driven status transitions.
+  async updateBatchJob(
+    id: string,
+    patch: Partial<Pick<BatchJob, "batchId" | "status">>,
+  ): Promise<void> {
+    await db.update(batchJobs).set(patch).where(eq(batchJobs.id, id));
   }
 
   async listCalibrations(): Promise<CalibrationSummary[]> {

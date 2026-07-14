@@ -88,9 +88,13 @@ declare module "http" {
 
 app.use(
   express.json({
-    // ~25 MB covers a full 2,000-row batch of text-heavy LinkedIn profiles
-    // serialized to JSON (column names repeat per row, so JSON > raw CSV size).
-    limit: "25mb",
+    // The batch-submit POST now carries BOTH the filtered rows-JSON (<=1100
+    // rows) AND the raw csvText (bounded to 5,000,000 chars server-side) so the
+    // batch_jobs row can rebuild exports without localStorage. Worst-case single
+    // file ~= 15 MB rows + 5 MB csvText + overhead ~= 20 MB; 40 MB gives ~2x
+    // headroom so a mid-drop file can never 413. Submits are per-file, so this
+    // limit is NOT multiplied by the number of files in a drop.
+    limit: "40mb",
     verify: (req, _res, buf) => {
       req.rawBody = buf;
     },

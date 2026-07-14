@@ -93,6 +93,23 @@ export const calibrations = pgTable("calibrations", {
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
 });
 
+// Durable record of every submitted batch job. Makes Neon — not the browser's
+// localStorage — the source of truth so a billed Anthropic batch can never be
+// orphaned by a client-side crash. The row is inserted with status "submitting"
+// BEFORE the Anthropic create() call (intent-log-before-side-effect), then
+// updated with the real batch_id. csvText/preResolved are the large fields and
+// are excluded from list queries (see BatchJobSummary) to avoid egress cost.
+export const batchJobs = pgTable("batch_jobs", {
+  id: text("id").primaryKey(),
+  batchId: text("batch_id"), // Anthropic batch id; NULL until create() returns (or for all-hard-blocked jobs)
+  status: text("status").notNull(), // submitting | pending | complete | error | canceled
+  fileName: text("file_name").notNull(),
+  rowCount: integer("row_count").notNull(),
+  csvText: text("csv_text").notNull(), // full original CSV — rebuilds exports; NEVER selected in list queries
+  preResolved: text("pre_resolved").notNull(), // JSON-encoded Record<number, MatchResult> of hard-blocked rows
+  createdAt: bigint("created_at", { mode: "number" }).notNull(),
+});
+
 export const insertSavedFileSchema = createInsertSchema(savedFiles).omit({
   id: true,
   createdAt: true,
@@ -126,6 +143,25 @@ export type SavedFileSummary = Omit<SavedFile, "csvText" | "historyKeyHash">;
 export type CalibrationRequest = z.infer<typeof calibrationRequestSchema>;
 export type Calibration = typeof calibrations.$inferSelect;
 export type CalibrationSummary = Omit<Calibration, "historyKeyHash">;
+
+// Batch jobs. A "complete" all-hard-blocked job (no Anthropic batch) is created
+// straight from the client via POST; billed jobs are created server-side by the
+// /api/match/batch submit flow. status is the only field the client PATCHes.
+const BATCH_STATUS = ["submitting", "pending", "complete", "error", "canceled"] as const;
+export const batchJobRequestSchema = z.object({
+  batchId: z.string().max(200).nullable().optional(),
+  status: z.enum(BATCH_STATUS),
+  fileName: z.string().min(1).max(240),
+  rowCount: z.number().int().min(0),
+  csvText: z.string().min(1).max(5_000_000),
+  preResolved: z.string().max(10_000_000), // JSON-encoded; generous bound
+});
+export const batchJobPatchSchema = z.object({
+  status: z.enum(BATCH_STATUS),
+});
+export type BatchJobRequest = z.infer<typeof batchJobRequestSchema>;
+export type BatchJob = typeof batchJobs.$inferSelect;
+export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved">;
 
 // Re-export matcher / template types for client + server use.
 export type { RoleLibraryJob, MatchResult } from "./matcher";

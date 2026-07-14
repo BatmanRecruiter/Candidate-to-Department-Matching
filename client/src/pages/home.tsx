@@ -260,13 +260,16 @@ export default function Home() {
   // --- Batch mode ---
   const BATCH_JOBS_KEY = "phdata-batch-jobs";
 
+  // id is the server-side batch_jobs row id — used to GET /api/batch-jobs/:id for
+  // the full csvText when building an export. csvText is intentionally NOT stored
+  // here: keeping 19 files' worth of raw CSV in localStorage is what blew the
+  // quota and crashed the tab. It lives in Neon now (the source of truth).
   interface StoredBatchJob {
     id: string;
     batchId: string | null;
     fileName: string;
     rowCount: number;
     submittedAt: number;
-    csvText: string;
     preResolved: Record<number, MatchResult>;
     status: "pending" | "complete" | "error" | "canceled";
   }
@@ -274,7 +277,17 @@ export default function Home() {
   const [batchMode, setBatchMode] = useState(false);
   const [batchJobs, setBatchJobs] = useState<StoredBatchJob[]>(() => {
     try {
-      return JSON.parse(localStorage.getItem(BATCH_JOBS_KEY) ?? "[]");
+      const raw = JSON.parse(localStorage.getItem(BATCH_JOBS_KEY) ?? "[]");
+      const all: StoredBatchJob[] = Array.isArray(raw) ? raw : [];
+      // One-time purge of pre-migration entries: the OLD shape embedded a
+      // `csvText` field and used a client-generated id with no matching Neon
+      // row, so its export path would 404. History says none were ever really
+      // submitted; this clears any stale/dev leftovers so they can't 404.
+      const cleaned = all.filter((j) => !("csvText" in j));
+      if (cleaned.length !== all.length) {
+        localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(cleaned));
+      }
+      return cleaned;
     } catch {
       return [];
     }
@@ -320,6 +333,7 @@ export default function Home() {
       setProgress(0);
 
       interface BatchResponse {
+        jobId?: string; // server batch_jobs row id, returned on a confirmed submit
         batchId: string | null;
         rowCount: number;
         preResolved: Record<number, MatchResult>;
@@ -329,16 +343,18 @@ export default function Home() {
         estimatedCostUsd?: number;
         llmRows?: number;
       }
-      const saveJob = (file: File, csvText: string, data: BatchResponse) => {
+      // Cache a lightweight summary locally, keyed by the SERVER's batch_jobs row
+      // id (jobId) so exports can fetch the full csvText from Neon. No csvText is
+      // stored client-side.
+      const saveJob = (jobId: string, data: BatchResponse, status: StoredBatchJob["status"]) => {
         const job: StoredBatchJob = {
-          id: crypto.randomUUID(),
+          id: jobId,
           batchId: data.batchId,
-          fileName: file.name,
+          fileName: data.fileName,
           rowCount: data.rowCount,
           submittedAt: Date.now(),
-          csvText,
           preResolved: data.preResolved ?? {},
-          status: "pending",
+          status,
         };
         saveBatchJobs((prev) => [job, ...prev]);
       };
@@ -382,8 +398,24 @@ export default function Home() {
           const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: file.name }, { "x-admin-passcode": passcode });
           const data = await res.json() as BatchResponse;
           if (data.allPreResolved) {
-            // Every row was hard-blocked — resolved for free, no confirmation needed.
-            saveJob(file, csvText, data);
+            // Every row was hard-blocked — resolved for free, no Anthropic batch.
+            // Persist a "complete" batch_jobs row (csvText lives in Neon, not
+            // localStorage), then cache the small summary keyed by its row id.
+            const persisted = await apiRequest(
+              "POST",
+              "/api/batch-jobs",
+              {
+                status: "complete",
+                batchId: null,
+                fileName: file.name,
+                rowCount: data.rowCount,
+                csvText,
+                preResolved: JSON.stringify(data.preResolved ?? {}),
+              },
+              { "x-admin-passcode": passcode },
+            );
+            const { id: jobId } = (await persisted.json()) as { id: string };
+            saveJob(jobId, data, "complete");
             return { kind: "preResolved" };
           }
           return {
@@ -457,9 +489,10 @@ export default function Home() {
           try {
             const csvText = await p.file.text();
             const matchRows = parseCsvText(csvText).rows.map((r) => filterRowForMatching(r).row);
-            const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: p.file.name, confirmCost: true }, { "x-admin-passcode": passcode });
+            const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: p.file.name, confirmCost: true, csvText }, { "x-admin-passcode": passcode });
             const data = await res.json() as BatchResponse;
-            saveJob(p.file, csvText, data);
+            if (!data.jobId) throw new Error("server did not return a batch job id");
+            saveJob(data.jobId, data, "pending");
             submitted++;
           } catch (err) {
             submitFailures.push(p.file.name);
@@ -510,9 +543,6 @@ export default function Home() {
         }
       | { ready: false; status: string }
     > => {
-      const { headers, rows } = parseCsvText(job.csvText);
-      const exportHeaders = buildExportHeaders(headers);
-
       let resultsByIndex: Record<number, MatchResult> = job.preResolved;
       if (job.batchId) {
         const res = await apiRequest(
@@ -530,13 +560,48 @@ export default function Home() {
         }
         resultsByIndex = { ...job.preResolved, ...data.results };
 
-        // Mark job complete in localStorage.
+        // Mark job complete in localStorage AND in the durable Neon row (status
+        // is client-driven via PATCH; fire-and-forget so it can't block the UI).
         setBatchJobs((prev) => {
           const updated = prev.map((j) => j.id === job.id ? { ...j, status: "complete" as const } : j);
           localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(updated));
           return updated;
         });
+        void apiRequest(
+          "PATCH",
+          `/api/batch-jobs/${job.id}`,
+          { status: "complete" },
+          { "x-admin-passcode": adminPasscode.trim() },
+        ).catch(() => {});
       }
+
+      // Results are ready — fetch the full csvText from Neon (the source of
+      // truth) ONLY now, so a 30 s poll of a still-processing batch never
+      // re-downloads the CSV. This is the single point of csvText egress.
+      let csvText: string;
+      try {
+        const jobRes = await apiRequest(
+          "GET",
+          `/api/batch-jobs/${job.id}`,
+          undefined,
+          { "x-admin-passcode": adminPasscode.trim() },
+        );
+        ({ csvText } = (await jobRes.json()) as { csvText: string });
+      } catch (err) {
+        // A 404 means the job predates server-side storage (a legacy localStorage
+        // entry with no Neon row). Surface a clear, specific message instead of a
+        // generic failure.
+        if (err instanceof Error && err.message.startsWith("404")) {
+          const legacy = new Error(
+            "This job predates server storage — its saved data isn't available. Clear it and re-run the file.",
+          );
+          legacy.name = "LegacyJobError";
+          throw legacy;
+        }
+        throw err;
+      }
+      const { headers, rows } = parseCsvText(csvText);
+      const exportHeaders = buildExportHeaders(headers);
 
       const results: MatchResult[] = rows.map((_, i) => resultsByIndex[i] as MatchResult);
       const exportRows = rows.map((row, i) => buildExportRow(row, results[i], headers));
@@ -564,8 +629,15 @@ export default function Home() {
           fileName: job.fileName,
         });
         toast({ title: "Batch complete", description: `${job.rowCount} candidates scored. Results loaded below.` });
-      } catch {
-        if (!silent) toast({ title: "Check failed", description: "Could not retrieve batch results.", variant: "destructive" });
+      } catch (err) {
+        if (!silent) {
+          const legacy = err instanceof Error && err.name === "LegacyJobError";
+          toast({
+            title: legacy ? "Job predates server storage" : "Check failed",
+            description: legacy ? err.message : "Could not retrieve batch results.",
+            variant: "destructive",
+          });
+        }
       } finally {
         if (!silent) setCheckingBatch(null);
       }
@@ -584,8 +656,13 @@ export default function Home() {
         }
         const baseName = job.fileName.replace(/\.csv$/i, "");
         downloadXlsx(`${baseName}__phData-scored.xlsx`, resolved.exportHeaders, resolved.exportRows);
-      } catch {
-        toast({ title: "Download failed", description: "Could not retrieve batch results.", variant: "destructive" });
+      } catch (err) {
+        const legacy = err instanceof Error && err.name === "LegacyJobError";
+        toast({
+          title: legacy ? "Job predates server storage" : "Download failed",
+          description: legacy ? err.message : "Could not retrieve batch results.",
+          variant: "destructive",
+        });
       } finally {
         setDownloadingBatch(null);
       }
@@ -610,6 +687,12 @@ export default function Home() {
             j.id === job.id ? { ...j, status: "canceled" as const } : j,
           ),
         );
+        void apiRequest(
+          "PATCH",
+          `/api/batch-jobs/${job.id}`,
+          { status: "canceled" },
+          { "x-admin-passcode": passcode },
+        ).catch(() => {});
         toast({
           title: "Batch canceled",
           description: `${job.fileName} was stopped. Its results will not be loaded.`,
