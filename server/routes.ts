@@ -56,13 +56,21 @@ const TIPPING_POINT = 50;
 
 async function sendSlackNotification(text: string): Promise<void> {
   const webhookUrl = process.env.SLACK_WEBHOOK_URL;
-  if (!webhookUrl) return;
+  if (!webhookUrl) {
+    console.warn("[slack] SLACK_WEBHOOK_URL not set — skipping notification");
+    return;
+  }
   try {
-    await fetch(webhookUrl, {
+    const resp = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
+    if (resp.ok) {
+      console.log("[slack] notification sent");
+    } else {
+      console.warn("[slack] non-2xx:", resp.status, await resp.text());
+    }
   } catch (err) {
     console.warn("[slack] notification failed:", err);
   }
@@ -662,6 +670,10 @@ export async function registerRoutes(
 
       res.json({ status: "ended", requestCounts: batch.request_counts, results });
 
+      console.log(
+        `[batch] complete id=${req.params.id} env=${process.env.NODE_ENV} rows=${Object.keys(results).length}`,
+      );
+
       // Fire-and-forget Slack notification when batch completes.
       const fileName = typeof req.query.fileName === "string" ? req.query.fileName : "batch job";
       const counts = batch.request_counts as { succeeded: number; errored: number };
@@ -671,7 +683,7 @@ export async function registerRoutes(
         `${counts.succeeded} candidates scored` +
         (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
         `\nResults have been auto-loaded in the app.`,
-      ).catch(() => {});
+      ).catch((err) => console.warn("[slack] batch notification failed:", err));
     } catch (err) {
       next(err);
     }
