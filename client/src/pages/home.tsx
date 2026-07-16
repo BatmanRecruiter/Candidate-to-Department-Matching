@@ -36,6 +36,7 @@ import {
   LockKeyhole,
   Eye,
   Square,
+  AlertTriangle,
 } from "lucide-react";
 import { PhDataMark } from "@/components/logo";
 import { parseCsvText, rowsToCsv } from "@/lib/csv";
@@ -279,6 +280,7 @@ export default function Home() {
   const [downloadingBatch, setDownloadingBatch] = useState<string | null>(null);
   const [cancelingBatch, setCancelingBatch] = useState<string | null>(null);
   const [clearingBatchJobs, setClearingBatchJobs] = useState(false);
+  const [markingOrphan, setMarkingOrphan] = useState<string | null>(null);
 
   const saveBatchJobs = useCallback(
     (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
@@ -772,6 +774,40 @@ export default function Home() {
       setClearingBatchJobs(false);
     }
   }, [adminPasscode, toast]);
+
+  // Fix 4: submitting-orphans (status="submitting", batchId=null — intent rows
+  // written before create() returned). The hydrate effect hides them, but the
+  // same query already carries them; surface them so they can be cleared. Derived
+  // from the existing query — no refetch, no new endpoint, no Anthropic calls.
+  const orphans = (batchJobsQ.data ?? []).filter((s) => s.status === "submitting");
+
+  // "Mark as error" for one orphan -> existing PATCH; invalidate so it drops out
+  // of the query (mirrors clearAllBatchJobs).
+  const markOrphanError = useCallback(
+    async (id: string) => {
+      const passcode = adminPasscode.trim();
+      if (!passcode) return;
+      setMarkingOrphan(id);
+      try {
+        await apiRequest(
+          "PATCH",
+          `/api/batch-jobs/${id}`,
+          { status: "error" },
+          { "x-admin-passcode": passcode },
+        );
+        queryClient.invalidateQueries({ queryKey: ["/api/batch-jobs", passcode] });
+      } catch {
+        toast({
+          title: "Couldn't mark as error",
+          description: "Try again.",
+          variant: "destructive",
+        });
+      } finally {
+        setMarkingOrphan(null);
+      }
+    },
+    [adminPasscode, toast],
+  );
 
   // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
   useEffect(() => {
@@ -1340,11 +1376,42 @@ export default function Home() {
                       </button>
                     )}
                   </div>
+                  {orphans.length > 0 && (
+                    <div className="space-y-1 rounded border border-destructive/40 bg-destructive/5 p-1.5">
+                      <p className="text-[11px] font-semibold text-destructive flex items-center gap-1.5">
+                        <AlertTriangle className="h-3.5 w-3.5" /> Stuck submissions ({orphans.length})
+                      </p>
+                      {orphans.map((o) => (
+                        <div
+                          key={o.id}
+                          className="flex items-center justify-between gap-2 rounded border border-destructive/30 bg-background p-1.5"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-[11px] font-medium truncate" title={o.fileName}>
+                              {o.fileName}
+                            </p>
+                            <p className="text-[10px] text-muted-foreground">
+                              Never got a batch ID — the submission didn't complete.
+                            </p>
+                          </div>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 shrink-0 px-2 text-[10px]"
+                            onClick={() => markOrphanError(o.id)}
+                            disabled={markingOrphan === o.id}
+                          >
+                            {markingOrphan === o.id ? "Marking…" : "Mark as error"}
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {batchJobsQ.isLoading ? (
                     <p className="text-[11px] text-muted-foreground font-mono">
                       Loading batch jobs…
                     </p>
-                  ) : batchJobs.length === 0 ? (
+                  ) : batchJobs.length === 0 && orphans.length === 0 ? (
                     <p className="text-[11px] text-muted-foreground leading-relaxed">
                       No batch jobs yet. Submit CSVs in batch mode and they will
                       appear here.
