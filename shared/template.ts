@@ -145,7 +145,11 @@ export function formatTemplateCell(
       if (urlKey) id = extractLinkedInSlug(rowFields[urlKey] || "");
     }
     if (!id) return "";
-    return id.startsWith("'") ? id : "'" + id;
+    // Clean source-sheet artifacts: a leading text-guard apostrophe and a float
+    // ".0" on pure-integer IDs (anchored so vanity slugs and real decimals pass
+    // through). No apostrophe is re-added — in a generated .xlsx/CSV cell it
+    // renders as a literal character, never as Excel's text marker.
+    return id.replace(/^'/, "").replace(/^(\d+)\.0$/, "$1");
   }
 
   return value;
