@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, boolean } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -108,6 +108,7 @@ export const batchJobs = pgTable("batch_jobs", {
   csvText: text("csv_text").notNull(), // full original CSV — rebuilds exports; NEVER selected in list queries
   preResolved: text("pre_resolved").notNull(), // JSON-encoded Record<number, MatchResult> of hard-blocked rows
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
+  archived: boolean("archived").notNull().default(false), // soft-hide for "Clear all"; never hard-deleted, so the durable billing record survives
 });
 
 export const insertSavedFileSchema = createInsertSchema(savedFiles).omit({

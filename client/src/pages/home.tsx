@@ -47,7 +47,7 @@ import {
 import type { MatchResult, RoleLibraryJob } from "@shared/matcher";
 import { filterRowForMatching, hasNameColumn, isMatchRelevantHeader } from "@shared/match-columns";
 import { APPENDED_COLUMNS, COLUMN_TEMPLATE } from "@shared/template";
-import type { CalibrationSummary, SavedFileSummary } from "@shared/schema";
+import type { BatchJobSummary, CalibrationSummary, SavedFileSummary } from "@shared/schema";
 
 // Batch-wide safety bounds for multi-file batch submission (per-file rows are
 // already capped at 1100). These cap the WHOLE drop so parsing many files can't
@@ -260,52 +260,74 @@ export default function Home() {
   // --- Batch mode ---
   const BATCH_JOBS_KEY = "phdata-batch-jobs";
 
-  // id is the server-side batch_jobs row id — used to GET /api/batch-jobs/:id for
-  // the full csvText when building an export. csvText is intentionally NOT stored
-  // here: keeping 19 files' worth of raw CSV in localStorage is what blew the
-  // quota and crashed the tab. It lives in Neon now (the source of truth).
+  // In-memory list item, hydrated from Neon (the source of truth) via
+  // GET /api/batch-jobs. id is the batch_jobs row id — used to GET
+  // /api/batch-jobs/:id for the full csvText AND preResolved when building an
+  // export. Nothing here is persisted to localStorage anymore.
   interface StoredBatchJob {
     id: string;
     batchId: string | null;
     fileName: string;
     rowCount: number;
     submittedAt: number;
-    preResolved: Record<number, MatchResult>;
     status: "pending" | "complete" | "error" | "canceled";
   }
 
   const [batchMode, setBatchMode] = useState(false);
-  const [batchJobs, setBatchJobs] = useState<StoredBatchJob[]>(() => {
-    try {
-      const raw = JSON.parse(localStorage.getItem(BATCH_JOBS_KEY) ?? "[]");
-      const all: StoredBatchJob[] = Array.isArray(raw) ? raw : [];
-      // One-time purge of pre-migration entries: the OLD shape embedded a
-      // `csvText` field and used a client-generated id with no matching Neon
-      // row, so its export path would 404. History says none were ever really
-      // submitted; this clears any stale/dev leftovers so they can't 404.
-      const cleaned = all.filter((j) => !("csvText" in j));
-      if (cleaned.length !== all.length) {
-        localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(cleaned));
-      }
-      return cleaned;
-    } catch {
-      return [];
-    }
-  });
+  const [batchJobs, setBatchJobs] = useState<StoredBatchJob[]>([]);
   const [checkingBatch, setCheckingBatch] = useState<string | null>(null);
   const [downloadingBatch, setDownloadingBatch] = useState<string | null>(null);
   const [cancelingBatch, setCancelingBatch] = useState<string | null>(null);
+  const [clearingBatchJobs, setClearingBatchJobs] = useState(false);
 
   const saveBatchJobs = useCallback(
     (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
-      setBatchJobs((prev) => {
-        const next = typeof update === "function" ? update(prev) : update;
-        localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(next));
-        return next;
-      });
+      setBatchJobs((prev) => (typeof update === "function" ? update(prev) : update));
     },
     [],
   );
+
+  // Hydrate the job list from Neon (durable source of truth) once the admin
+  // passcode is set. localStorage is retired. Loads once per passcode
+  // (staleTime Infinity, no focus refetch) so the 30 s poll's optimistic
+  // in-memory updates are never clobbered by a background refetch.
+  const batchJobsQ = useQuery<BatchJobSummary[]>({
+    queryKey: ["/api/batch-jobs", adminPasscode.trim()],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/batch-jobs", undefined, {
+        "x-admin-passcode": adminPasscode.trim(),
+      });
+      return res.json();
+    },
+    enabled: !!adminPasscode.trim(),
+    refetchOnWindowFocus: false,
+    staleTime: Infinity,
+  });
+
+  // Map server summaries into the in-memory list. Orphaned "submitting" rows are
+  // suppressed — filter on STATUS, never on batchId, since an all-hard-blocked
+  // "complete" job legitimately has batchId=null and must stay visible. Real
+  // orphan reconciliation is Fix 4's job.
+  useEffect(() => {
+    if (!batchJobsQ.data) return;
+    setBatchJobs(
+      batchJobsQ.data
+        .filter((s) => s.status !== "submitting")
+        .map((s) => ({
+          id: s.id,
+          batchId: s.batchId,
+          fileName: s.fileName,
+          rowCount: s.rowCount,
+          submittedAt: s.createdAt,
+          status: s.status as StoredBatchJob["status"],
+        })),
+    );
+  }, [batchJobsQ.data]);
+
+  // One-time cleanup of the retired localStorage cache.
+  useEffect(() => {
+    localStorage.removeItem(BATCH_JOBS_KEY);
+  }, []);
 
   // Two-phase submission with a pre-flight cost guard: every file is first
   // sent for a server-side USD estimate (nothing is submitted), then ONE
@@ -353,7 +375,6 @@ export default function Home() {
           fileName: data.fileName,
           rowCount: data.rowCount,
           submittedAt: Date.now(),
-          preResolved: data.preResolved ?? {},
           status,
         };
         saveBatchJobs((prev) => [job, ...prev]);
@@ -543,7 +564,10 @@ export default function Home() {
         }
       | { ready: false; status: string }
     > => {
-      let resultsByIndex: Record<number, MatchResult> = job.preResolved;
+      // For a live Anthropic batch, poll status FIRST and bail early while still
+      // processing — never fetch the big csvText/preResolved row on a
+      // still-processing 30 s poll (the single point of csvText egress).
+      let apiResults: Record<number, MatchResult> | null = null;
       if (job.batchId) {
         const res = await apiRequest(
           "GET",
@@ -558,15 +582,15 @@ export default function Home() {
         if (data.status !== "ended" || !data.results) {
           return { ready: false, status: data.status };
         }
-        resultsByIndex = { ...job.preResolved, ...data.results };
+        apiResults = data.results;
 
-        // Mark job complete in localStorage AND in the durable Neon row (status
-        // is client-driven via PATCH; fire-and-forget so it can't block the UI).
-        setBatchJobs((prev) => {
-          const updated = prev.map((j) => j.id === job.id ? { ...j, status: "complete" as const } : j);
-          localStorage.setItem(BATCH_JOBS_KEY, JSON.stringify(updated));
-          return updated;
-        });
+        // Mark complete: optimistic in-memory update (no full-list refetch, so a
+        // multi-file poll can't trigger a refetch storm) + durable Neon row via
+        // PATCH (fire-and-forget). No localStorage — Neon is authoritative on the
+        // next hydrate.
+        setBatchJobs((prev) =>
+          prev.map((j) => (j.id === job.id ? { ...j, status: "complete" as const } : j)),
+        );
         void apiRequest(
           "PATCH",
           `/api/batch-jobs/${job.id}`,
@@ -575,10 +599,13 @@ export default function Home() {
         ).catch(() => {});
       }
 
-      // Results are ready — fetch the full csvText from Neon (the source of
-      // truth) ONLY now, so a 30 s poll of a still-processing batch never
-      // re-downloads the CSV. This is the single point of csvText egress.
+      // Results are ready (batch ended, or an all-hard-blocked job with no
+      // batch). Fetch the full Neon row ONCE — the single point of
+      // csvText/preResolved egress, and now the source of preResolved too
+      // (localStorage retired). For an all-hard-blocked job this IS the entire
+      // result set, which is why the fetch precedes building resultsByIndex.
       let csvText: string;
+      let preResolved: Record<number, MatchResult>;
       try {
         const jobRes = await apiRequest(
           "GET",
@@ -586,7 +613,11 @@ export default function Home() {
           undefined,
           { "x-admin-passcode": adminPasscode.trim() },
         );
-        ({ csvText } = (await jobRes.json()) as { csvText: string });
+        const full = (await jobRes.json()) as { csvText: string; preResolved: string };
+        csvText = full.csvText;
+        preResolved = full.preResolved
+          ? (JSON.parse(full.preResolved) as Record<number, MatchResult>)
+          : {};
       } catch (err) {
         // A 404 means the job predates server-side storage (a legacy localStorage
         // entry with no Neon row). Surface a clear, specific message instead of a
@@ -600,6 +631,13 @@ export default function Home() {
         }
         throw err;
       }
+
+      // preResolved (hard-blocked rows) is the base; live API results overlay it.
+      const resultsByIndex: Record<number, MatchResult> = {
+        ...preResolved,
+        ...(apiResults ?? {}),
+      };
+
       const { headers, rows } = parseCsvText(csvText);
       const exportHeaders = buildExportHeaders(headers);
 
@@ -710,6 +748,30 @@ export default function Home() {
     },
     [adminPasscode, saveBatchJobs, toast],
   );
+
+  // "Clear all" → soft-hide via the server archived flag (never a hard delete,
+  // so the durable billing record survives). Optimistic clear + invalidate so
+  // the next hydrate reflects the server.
+  const clearAllBatchJobs = useCallback(async () => {
+    const passcode = adminPasscode.trim();
+    if (!passcode) return;
+    setClearingBatchJobs(true);
+    try {
+      await apiRequest("POST", "/api/batch-jobs/archive", undefined, {
+        "x-admin-passcode": passcode,
+      });
+      setBatchJobs([]);
+      queryClient.invalidateQueries({ queryKey: ["/api/batch-jobs", passcode] });
+    } catch {
+      toast({
+        title: "Clear failed",
+        description: "Could not archive batch jobs. Try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setClearingBatchJobs(false);
+    }
+  }, [adminPasscode, toast]);
 
   // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
   useEffect(() => {
@@ -1261,20 +1323,33 @@ export default function Home() {
                   )}
                 </div>
               )}
-              {adminPasscode.trim() && batchJobs.length > 0 && (
+              {adminPasscode.trim() && (
                 <div className="space-y-1.5 rounded-md border border-border/70 bg-background/60 p-2">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs font-semibold flex items-center gap-1.5">
                       <Archive className="h-3.5 w-3.5" /> Batch jobs
                     </p>
-                    <button
-                      type="button"
-                      className="text-[10px] text-muted-foreground hover:text-foreground"
-                      onClick={() => saveBatchJobs([])}
-                    >
-                      Clear all
-                    </button>
+                    {batchJobs.length > 0 && (
+                      <button
+                        type="button"
+                        className="text-[10px] text-muted-foreground hover:text-foreground"
+                        onClick={clearAllBatchJobs}
+                        disabled={clearingBatchJobs}
+                      >
+                        {clearingBatchJobs ? "Clearing…" : "Clear all"}
+                      </button>
+                    )}
                   </div>
+                  {batchJobsQ.isLoading ? (
+                    <p className="text-[11px] text-muted-foreground font-mono">
+                      Loading batch jobs…
+                    </p>
+                  ) : batchJobs.length === 0 ? (
+                    <p className="text-[11px] text-muted-foreground leading-relaxed">
+                      No batch jobs yet. Submit CSVs in batch mode and they will
+                      appear here.
+                    </p>
+                  ) : (
                   <div className="max-h-80 overflow-y-auto space-y-1.5 pr-0.5">
                     {batchJobs.slice(0, 50).map((job) => (
                       <div key={job.id} className="rounded border border-border/50 bg-background p-1.5 space-y-1">
@@ -1351,6 +1426,7 @@ export default function Home() {
                       </div>
                     ))}
                   </div>
+                  )}
                 </div>
               )}
               {adminPasscode.trim() && savedFilesQ.isLoading && (

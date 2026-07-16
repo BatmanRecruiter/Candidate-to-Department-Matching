@@ -30,11 +30,12 @@ export interface IStorage {
   listBatchJobs(): Promise<BatchJobSummary[]>;
   getBatchJob(id: string): Promise<BatchJob | undefined>;
   countBatchJobs(): Promise<number>;
-  createBatchJob(job: BatchJob): Promise<BatchJob>;
+  createBatchJob(job: typeof batchJobs.$inferInsert): Promise<BatchJob>;
   updateBatchJob(
     id: string,
     patch: Partial<Pick<BatchJob, "batchId" | "status">>,
   ): Promise<void>;
+  archiveAllBatchJobs(): Promise<void>;
   listCalibrations(): Promise<CalibrationSummary[]>;
   listCorrections(): Promise<CalibrationSummary[]>;
   countCalibrations(): Promise<number>;
@@ -113,8 +114,10 @@ export class DatabaseStorage implements IStorage {
         fileName: batchJobs.fileName,
         rowCount: batchJobs.rowCount,
         createdAt: batchJobs.createdAt,
+        archived: batchJobs.archived,
       })
       .from(batchJobs)
+      .where(eq(batchJobs.archived, false))
       .orderBy(desc(batchJobs.createdAt))
       .limit(100);
   }
@@ -129,7 +132,7 @@ export class DatabaseStorage implements IStorage {
     return row?.value ?? 0;
   }
 
-  async createBatchJob(job: BatchJob): Promise<BatchJob> {
+  async createBatchJob(job: typeof batchJobs.$inferInsert): Promise<BatchJob> {
     const [row] = await db.insert(batchJobs).values(job).returning();
     return row;
   }
@@ -142,6 +145,15 @@ export class DatabaseStorage implements IStorage {
     patch: Partial<Pick<BatchJob, "batchId" | "status">>,
   ): Promise<void> {
     await db.update(batchJobs).set(patch).where(eq(batchJobs.id, id));
+  }
+
+  // "Clear all" soft-hide: mark every visible job archived instead of deleting,
+  // so a durable billing record is never lost (reversible via the flag).
+  async archiveAllBatchJobs(): Promise<void> {
+    await db
+      .update(batchJobs)
+      .set({ archived: true })
+      .where(eq(batchJobs.archived, false));
   }
 
   async listCalibrations(): Promise<CalibrationSummary[]> {

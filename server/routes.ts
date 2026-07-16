@@ -320,6 +320,18 @@ export async function registerRoutes(
     }
   });
 
+  // Soft-hide every job ("Clear all"): archive rather than delete so the durable
+  // billing record is never lost. Reversible via the archived flag.
+  app.post("/api/batch-jobs/archive", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      await storage.archiveAllBatchJobs();
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get("/api/calibrations", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
