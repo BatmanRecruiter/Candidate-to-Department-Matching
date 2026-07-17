@@ -40,7 +40,8 @@ import {
 } from "lucide-react";
 import { PhDataMark } from "@/components/logo";
 import { parseCsvText, rowsToCsv } from "@/lib/csv";
-import { downloadXlsx } from "@/lib/xlsx";
+import { buildXlsxBytes, downloadBytes, downloadXlsx, XLSX_MIME } from "@/lib/xlsx";
+import { zipSync } from "fflate";
 import {
   buildExportHeaders,
   buildExportRow,
@@ -272,6 +273,7 @@ export default function Home() {
     rowCount: number;
     submittedAt: number;
     status: "pending" | "complete" | "error" | "canceled";
+    submissionId: string | null; // groups one drop's jobs ("this run"); null on legacy rows
   }
 
   const [batchMode, setBatchMode] = useState(false);
@@ -281,6 +283,7 @@ export default function Home() {
   const [cancelingBatch, setCancelingBatch] = useState<string | null>(null);
   const [clearingBatchJobs, setClearingBatchJobs] = useState(false);
   const [markingOrphan, setMarkingOrphan] = useState<string | null>(null);
+  const [runExport, setRunExport] = useState<{ current: number; total: number } | null>(null);
 
   const saveBatchJobs = useCallback(
     (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
@@ -322,6 +325,7 @@ export default function Home() {
           rowCount: s.rowCount,
           submittedAt: s.createdAt,
           status: s.status as StoredBatchJob["status"],
+          submissionId: s.submissionId,
         })),
     );
   }, [batchJobsQ.data]);
@@ -383,6 +387,7 @@ export default function Home() {
           rowCount: data.rowCount,
           submittedAt: Date.now(),
           status,
+          submissionId,
         };
         saveBatchJobs((prev) => [job, ...prev]);
       };
@@ -837,6 +842,76 @@ export default function Home() {
     },
     [adminPasscode, toast],
   );
+
+  // "Download this run" = every COMPLETE job from the latest submission drop.
+  // Legacy rows have submissionId=null and must NOT group together, so a
+  // null-id latest is a run of one.
+  const latestRun = (() => {
+    const completes = batchJobs.filter((j) => j.status === "complete");
+    if (completes.length === 0) return [] as StoredBatchJob[];
+    const latest = completes.reduce((a, b) => (b.submittedAt > a.submittedAt ? b : a));
+    return latest.submissionId
+      ? completes.filter((j) => j.submissionId === latest.submissionId)
+      : [latest];
+  })();
+
+  const downloadRun = useCallback(async () => {
+    if (latestRun.length === 0) return;
+    const files: Record<string, Uint8Array> = {};
+    const skipped: string[] = [];
+    setRunExport({ current: 0, total: latestRun.length });
+    try {
+      // Sequential on purpose: one full Neon row in memory at a time, and the
+      // server never juggles concurrent big-row reads. Skip-and-continue — one
+      // bad job never aborts the export.
+      for (let i = 0; i < latestRun.length; i++) {
+        const job = latestRun[i];
+        setRunExport({ current: i + 1, total: latestRun.length });
+        try {
+          const resolved = await fetchBatchResults(job);
+          if (!resolved.ready) {
+            skipped.push(`${job.fileName} (still ${resolved.status})`);
+            continue;
+          }
+          const baseName = job.fileName.replace(/\.csv$/i, "");
+          files[`${baseName}__phData-scored.xlsx`] = buildXlsxBytes(
+            resolved.exportHeaders,
+            resolved.exportRows,
+          );
+        } catch (err) {
+          const legacy = err instanceof Error && err.name === "LegacyJobError";
+          skipped.push(`${job.fileName} (${legacy ? "predates server storage" : "fetch failed"})`);
+        }
+      }
+
+      const names = Object.keys(files);
+      if (names.length === 0) {
+        toast({
+          title: "Nothing exported",
+          description: `All ${latestRun.length} job(s) failed. Skipped: ${skipped.join(", ")}`,
+          variant: "destructive",
+        });
+        return;
+      }
+      if (names.length === 1) {
+        downloadBytes(names[0], files[names[0]], XLSX_MIME);
+      } else {
+        // xlsx entries are already deflate-compressed — store (level 0), don't recompress.
+        const runDate = new Date(latestRun[0].submittedAt).toISOString().slice(0, 10);
+        downloadBytes(`phData-run-${runDate}.zip`, zipSync(files, { level: 0 }), "application/zip");
+      }
+      toast({
+        title: `${names.length} of ${latestRun.length} exported`,
+        description:
+          skipped.length > 0
+            ? `Skipped: ${skipped.join(", ")}`
+            : "Every file in this run was exported.",
+        variant: skipped.length > 0 ? "destructive" : undefined,
+      });
+    } finally {
+      setRunExport(null);
+    }
+  }, [latestRun, fetchBatchResults, toast]);
 
   // Auto-poll every 30 s while there are pending batch jobs and admin is authenticated.
   useEffect(() => {
@@ -1394,16 +1469,31 @@ export default function Home() {
                     <p className="text-xs font-semibold flex items-center gap-1.5">
                       <Archive className="h-3.5 w-3.5" /> Batch jobs
                     </p>
-                    {batchJobs.length > 0 && (
-                      <button
-                        type="button"
-                        className="text-[10px] text-muted-foreground hover:text-foreground"
-                        onClick={clearAllBatchJobs}
-                        disabled={clearingBatchJobs}
-                      >
-                        {clearingBatchJobs ? "Clearing…" : "Clear all"}
-                      </button>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {latestRun.length > 0 && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="h-6 shrink-0 px-2 text-[10px]"
+                          onClick={downloadRun}
+                          disabled={!!runExport}
+                        >
+                          {runExport
+                            ? `Exporting ${runExport.current} of ${runExport.total}…`
+                            : `Download this run (${latestRun.length} file${latestRun.length === 1 ? "" : "s"})`}
+                        </Button>
+                      )}
+                      {batchJobs.length > 0 && (
+                        <button
+                          type="button"
+                          className="text-[10px] text-muted-foreground hover:text-foreground"
+                          onClick={clearAllBatchJobs}
+                          disabled={clearingBatchJobs}
+                        >
+                          {clearingBatchJobs ? "Clearing…" : "Clear all"}
+                        </button>
+                      )}
+                    </div>
                   </div>
                   {orphans.length > 0 && (
                     <div className="space-y-1 rounded border border-destructive/40 bg-destructive/5 p-1.5">

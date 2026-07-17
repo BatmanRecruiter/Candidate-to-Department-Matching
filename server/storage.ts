@@ -114,6 +114,7 @@ export class DatabaseStorage implements IStorage {
         status: batchJobs.status,
         fileName: batchJobs.fileName,
         rowCount: batchJobs.rowCount,
+        submissionId: batchJobs.submissionId, // tiny string — the "this run" grouping key; results stays excluded
         createdAt: batchJobs.createdAt,
         archived: batchJobs.archived,
       })

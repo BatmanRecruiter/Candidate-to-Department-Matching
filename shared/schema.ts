@@ -166,7 +166,7 @@ export const batchJobPatchSchema = z.object({
 });
 export type BatchJobRequest = z.infer<typeof batchJobRequestSchema>;
 export type BatchJob = typeof batchJobs.$inferSelect;
-export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved" | "results" | "submissionId">;
+export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved" | "results">;
 
 // Re-export matcher / template types for client + server use.
 export type { RoleLibraryJob, MatchResult } from "./matcher";

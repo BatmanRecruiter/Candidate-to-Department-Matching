@@ -51,14 +51,12 @@ const THIN_BORDER = {
 };
 
 /**
- * Build and trigger a download of a styled .xlsx file.
+ * Build a styled workbook and return it as xlsx bytes (no download triggered).
  * Applies column-group color coding, frozen header row, autofilter, and borders.
+ * The zip export path uses this so a multi-file run never fires N separate
+ * browser downloads.
  */
-export function downloadXlsx(
-  filename: string,
-  headers: string[],
-  rows: string[][],
-): void {
+export function buildXlsxBytes(headers: string[], rows: string[][]): Uint8Array {
   const aoa: string[][] = [headers, ...rows];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ws: any = XLSXStyle.utils.aoa_to_sheet(aoa);
@@ -113,6 +111,35 @@ export function downloadXlsx(
   const wb = XLSXStyle.utils.book_new();
   XLSXStyle.utils.book_append_sheet(wb, ws, "Candidates");
 
+  return new Uint8Array(XLSXStyle.write(wb, { type: "array" }) as ArrayBuffer);
+}
+
+/** Trigger a browser download of raw bytes (mirrors downloadCsv's anchor flow). */
+export function downloadBytes(
+  filename: string,
+  bytes: Uint8Array,
+  mimeType: string,
+): void {
+  const blob = new Blob([bytes as BlobPart], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+export const XLSX_MIME =
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+/** Build and trigger a download of a single styled .xlsx file. */
+export function downloadXlsx(
+  filename: string,
+  headers: string[],
+  rows: string[][],
+): void {
   const xlsxFilename = filename.replace(/\.csv$/i, "") + ".xlsx";
-  XLSXStyle.writeFile(wb, xlsxFilename);
+  downloadBytes(xlsxFilename, buildXlsxBytes(headers, rows), XLSX_MIME);
 }
