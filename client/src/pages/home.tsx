@@ -352,6 +352,11 @@ export default function Home() {
         });
         return;
       }
+      // One uuid per drop: every row this call creates (phase-1 all-hard-blocked
+      // POSTs and phase-2 confirmed submits) shares it, so "this run" stays
+      // unambiguous however long the cost dialog sits open between the phases.
+      const submissionId = crypto.randomUUID();
+
       setError(null);
       setProcessing(true);
       setProgress(0);
@@ -434,6 +439,7 @@ export default function Home() {
                 rowCount: data.rowCount,
                 csvText,
                 preResolved: JSON.stringify(data.preResolved ?? {}),
+                submissionId,
               },
               { "x-admin-passcode": passcode },
             );
@@ -512,7 +518,7 @@ export default function Home() {
           try {
             const csvText = await p.file.text();
             const matchRows = parseCsvText(csvText).rows.map((r) => filterRowForMatching(r).row);
-            const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: p.file.name, confirmCost: true, csvText }, { "x-admin-passcode": passcode });
+            const res = await apiRequest("POST", "/api/match/batch", { rows: matchRows, fileName: p.file.name, confirmCost: true, csvText, submissionId }, { "x-admin-passcode": passcode });
             const data = await res.json() as BatchResponse;
             if (!data.jobId) throw new Error("server did not return a batch job id");
             saveJob(data.jobId, data, "pending");
@@ -566,11 +572,57 @@ export default function Home() {
         }
       | { ready: false; status: string }
     > => {
-      // For a live Anthropic batch, poll status FIRST and bail early while still
-      // processing — never fetch the big csvText/preResolved row on a
-      // still-processing 30 s poll (the single point of csvText egress).
+      // Full Neon row (csvText + preResolved + stored results) — the single
+      // point of csvText egress. A 404 means the job predates server-side
+      // storage (a legacy localStorage entry with no Neon row); surface a
+      // clear, specific message instead of a generic failure.
+      const fetchFullRow = async (): Promise<{
+        csvText: string;
+        preResolved: string;
+        results: string | null;
+      }> => {
+        try {
+          const jobRes = await apiRequest(
+            "GET",
+            `/api/batch-jobs/${job.id}`,
+            undefined,
+            { "x-admin-passcode": adminPasscode.trim() },
+          );
+          return (await jobRes.json()) as {
+            csvText: string;
+            preResolved: string;
+            results: string | null;
+          };
+        } catch (err) {
+          if (err instanceof Error && err.message.startsWith("404")) {
+            const legacy = new Error(
+              "This job predates server storage — its saved data isn't available. Clear it and re-run the file.",
+            );
+            legacy.name = "LegacyJobError";
+            throw legacy;
+          }
+          throw err;
+        }
+      };
+
       let apiResults: Record<number, MatchResult> | null = null;
-      if (job.batchId) {
+      let full: { csvText: string; preResolved: string; results: string | null } | null = null;
+
+      // A COMPLETE job reads Neon first: stored results skip the Anthropic
+      // retrieve entirely (no re-stream, no Slack refire, no 29-day results
+      // expiry). Null results (not yet backfilled) falls through to the
+      // Anthropic path below.
+      if (job.status === "complete") {
+        full = await fetchFullRow();
+        if (full.results) {
+          apiResults = JSON.parse(full.results) as Record<number, MatchResult>;
+        }
+      }
+
+      // For a live Anthropic batch (or a complete job with no stored results),
+      // poll status FIRST and bail early while still processing — never fetch
+      // the big csvText/preResolved row on a still-processing 30 s poll.
+      if (!apiResults && job.batchId) {
         const res = await apiRequest(
           "GET",
           `/api/match/batch/${job.batchId}?fileName=${encodeURIComponent(job.fileName)}`,
@@ -601,38 +653,15 @@ export default function Home() {
         ).catch(() => {});
       }
 
-      // Results are ready (batch ended, or an all-hard-blocked job with no
-      // batch). Fetch the full Neon row ONCE — the single point of
-      // csvText/preResolved egress, and now the source of preResolved too
-      // (localStorage retired). For an all-hard-blocked job this IS the entire
-      // result set, which is why the fetch precedes building resultsByIndex.
-      let csvText: string;
-      let preResolved: Record<number, MatchResult>;
-      try {
-        const jobRes = await apiRequest(
-          "GET",
-          `/api/batch-jobs/${job.id}`,
-          undefined,
-          { "x-admin-passcode": adminPasscode.trim() },
-        );
-        const full = (await jobRes.json()) as { csvText: string; preResolved: string };
-        csvText = full.csvText;
-        preResolved = full.preResolved
-          ? (JSON.parse(full.preResolved) as Record<number, MatchResult>)
-          : {};
-      } catch (err) {
-        // A 404 means the job predates server-side storage (a legacy localStorage
-        // entry with no Neon row). Surface a clear, specific message instead of a
-        // generic failure.
-        if (err instanceof Error && err.message.startsWith("404")) {
-          const legacy = new Error(
-            "This job predates server storage — its saved data isn't available. Clear it and re-run the file.",
-          );
-          legacy.name = "LegacyJobError";
-          throw legacy;
-        }
-        throw err;
-      }
+      // Results are ready (batch ended, stored results, or an all-hard-blocked
+      // job with no batch). For an all-hard-blocked job the row's preResolved
+      // IS the entire result set, which is why the fetch precedes building
+      // resultsByIndex.
+      if (!full) full = await fetchFullRow();
+      const csvText = full.csvText;
+      const preResolved: Record<number, MatchResult> = full.preResolved
+        ? (JSON.parse(full.preResolved) as Record<number, MatchResult>)
+        : {};
 
       // preResolved (hard-blocked rows) is the base; live API results overlay it.
       const resultsByIndex: Record<number, MatchResult> = {

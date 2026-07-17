@@ -14,7 +14,7 @@ import type {
 } from '@shared/schema';
 import { neon } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-http";
-import { count, desc, eq, ne } from "drizzle-orm";
+import { and, count, desc, eq, isNull, ne } from "drizzle-orm";
 
 const sql = neon(process.env.DATABASE_URL!);
 export const db = drizzle({ client: sql });
@@ -35,6 +35,7 @@ export interface IStorage {
     id: string,
     patch: Partial<Pick<BatchJob, "batchId" | "status">>,
   ): Promise<void>;
+  storeBatchResults(batchId: string, resultsJson: string): Promise<{ wrote: boolean }>;
   archiveAllBatchJobs(): Promise<void>;
   listCalibrations(): Promise<CalibrationSummary[]>;
   listCorrections(): Promise<CalibrationSummary[]>;
@@ -145,6 +146,22 @@ export class DatabaseStorage implements IStorage {
     patch: Partial<Pick<BatchJob, "batchId" | "status">>,
   ): Promise<void> {
     await db.update(batchJobs).set(patch).where(eq(batchJobs.id, id));
+  }
+
+  // Persist a completed batch's results, keyed by the Anthropic batch id.
+  // Writes ONLY while results is still null — the returned wrote=true is the
+  // atomic "first completion" signal that gates the one-time Slack notify.
+  // Idempotent, so repeat polls and the backfill script can call it freely.
+  async storeBatchResults(
+    batchId: string,
+    resultsJson: string,
+  ): Promise<{ wrote: boolean }> {
+    const updated = await db
+      .update(batchJobs)
+      .set({ results: resultsJson })
+      .where(and(eq(batchJobs.batchId, batchId), isNull(batchJobs.results)))
+      .returning({ id: batchJobs.id });
+    return { wrote: updated.length > 0 };
   }
 
   // "Clear all" soft-hide: mark every visible job archived instead of deleting,

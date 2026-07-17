@@ -296,6 +296,7 @@ export async function registerRoutes(
         rowCount: parsed.rowCount,
         csvText: parsed.csvText,
         preResolved: parsed.preResolved,
+        submissionId: parsed.submissionId ?? null,
         createdAt: Date.now(),
       });
       const { csvText: _csvText, preResolved: _preResolved, ...summary } = created;
@@ -459,11 +460,12 @@ export async function registerRoutes(
   app.post("/api/match/batch", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
-      const { rows, fileName, confirmCost, csvText } = req.body as {
+      const { rows, fileName, confirmCost, csvText, submissionId } = req.body as {
         rows: Record<string, string>[];
         fileName: string;
         confirmCost?: boolean;
         csvText?: string; // full original CSV; required only on the confirmed submit
+        submissionId?: string; // groups one drop's jobs ("this run"); confirmed submit only
       };
       if (!Array.isArray(rows) || rows.length === 0) {
         return res.status(400).json({ message: "rows must be a non-empty array" });
@@ -590,6 +592,10 @@ export async function registerRoutes(
         rowCount: rows.length,
         csvText,
         preResolved: JSON.stringify(preResolved),
+        submissionId:
+          typeof submissionId === "string" && submissionId.length > 0 && submissionId.length <= 64
+            ? submissionId
+            : null,
         createdAt: Date.now(),
       });
 
@@ -680,22 +686,37 @@ export async function registerRoutes(
         }
       }
 
+      // Persist results once, keyed by batch id (write-only-if-null). wrote=true
+      // is the atomic first-completion signal that gates the one-time Slack
+      // notify — re-polls and downloads can never refire it. A persist failure
+      // must not block the response; the next poll retries the write.
+      let firstCompletion = false;
+      try {
+        firstCompletion = (
+          await storage.storeBatchResults(req.params.id, JSON.stringify(results))
+        ).wrote;
+      } catch (persistErr) {
+        console.error(`[batch] persisting results failed id=${req.params.id}:`, persistErr);
+      }
+
       res.json({ status: "ended", requestCounts: batch.request_counts, results });
 
       console.log(
-        `[batch] complete id=${req.params.id} env=${process.env.NODE_ENV} rows=${Object.keys(results).length}`,
+        `[batch] complete id=${req.params.id} env=${process.env.NODE_ENV} rows=${Object.keys(results).length} firstCompletion=${firstCompletion}`,
       );
 
-      // Fire-and-forget Slack notification when batch completes.
-      const fileName = typeof req.query.fileName === "string" ? req.query.fileName : "batch job";
-      const counts = batch.request_counts as { succeeded: number; errored: number };
-      sendSlackNotification(
-        `*phData Matcher — Batch Complete* ✓\n` +
-        `File: ${fileName}\n` +
-        `${counts.succeeded} candidates scored` +
-        (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
-        `\nResults have been auto-loaded in the app.`,
-      ).catch((err) => console.warn("[slack] batch notification failed:", err));
+      if (firstCompletion) {
+        // Fire-and-forget Slack notification, first completion only.
+        const fileName = typeof req.query.fileName === "string" ? req.query.fileName : "batch job";
+        const counts = batch.request_counts as { succeeded: number; errored: number };
+        sendSlackNotification(
+          `*phData Matcher — Batch Complete* ✓\n` +
+          `File: ${fileName}\n` +
+          `${counts.succeeded} candidates scored` +
+          (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
+          `\nResults have been auto-loaded in the app.`,
+        ).catch((err) => console.warn("[slack] batch notification failed:", err));
+      }
     } catch (err) {
       next(err);
     }

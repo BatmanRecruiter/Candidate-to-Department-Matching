@@ -107,6 +107,8 @@ export const batchJobs = pgTable("batch_jobs", {
   rowCount: integer("row_count").notNull(),
   csvText: text("csv_text").notNull(), // full original CSV — rebuilds exports; NEVER selected in list queries
   preResolved: text("pre_resolved").notNull(), // JSON-encoded Record<number, MatchResult> of hard-blocked rows
+  results: text("results"), // JSON-encoded Record<number, MatchResult> from Anthropic; null = not stored yet (download falls back to the Anthropic retrieve)
+  submissionId: text("submission_id"), // shared by every job in one drop ("this run"); null on rows predating the column
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
   archived: boolean("archived").notNull().default(false), // soft-hide for "Clear all"; never hard-deleted, so the durable billing record survives
 });
@@ -156,13 +158,15 @@ export const batchJobRequestSchema = z.object({
   rowCount: z.number().int().min(0),
   csvText: z.string().min(1).max(5_000_000),
   preResolved: z.string().max(10_000_000), // JSON-encoded; generous bound
+  submissionId: z.string().min(1).max(64).nullable().optional(),
 });
+// status only — results is server-written (storeBatchResults), never client-writable.
 export const batchJobPatchSchema = z.object({
   status: z.enum(BATCH_STATUS),
 });
 export type BatchJobRequest = z.infer<typeof batchJobRequestSchema>;
 export type BatchJob = typeof batchJobs.$inferSelect;
-export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved">;
+export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved" | "results" | "submissionId">;
 
 // Re-export matcher / template types for client + server use.
 export type { RoleLibraryJob, MatchResult } from "./matcher";
