@@ -65,7 +65,10 @@ export async function cachedMessage({
       {
         type: "text",
         text: system,
-        cache_control: { type: "ephemeral", ttl },
+        // SDK 0.56.0's CacheControlEphemeral type ({ type: 'ephemeral' } only)
+        // lags the GA 1h-TTL API param — assert just this object, zero runtime
+        // change. Drop the assertion once the SDK type gains ttl.
+        cache_control: { type: "ephemeral", ttl } as Anthropic.CacheControlEphemeral,
       },
     ];
   } else if (tools && tools.length > 0) {
