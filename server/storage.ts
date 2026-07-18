@@ -28,6 +28,8 @@ export interface IStorage {
   countSavedFiles(): Promise<number>;
   createSavedFile(file: SavedFile): Promise<SavedFile>;
   listBatchJobs(): Promise<BatchJobSummary[]>;
+  listArchivedBatchJobs(): Promise<BatchJobSummary[]>;
+  setBatchJobArchived(id: string, archived: boolean): Promise<void>;
   getBatchJob(id: string): Promise<BatchJob | undefined>;
   countBatchJobs(): Promise<number>;
   createBatchJob(job: typeof batchJobs.$inferInsert): Promise<BatchJob>;
@@ -122,6 +124,30 @@ export class DatabaseStorage implements IStorage {
       .where(eq(batchJobs.archived, false))
       .orderBy(desc(batchJobs.createdAt))
       .limit(100);
+  }
+
+  // Same projection discipline as listBatchJobs (no csvText/preResolved/results
+  // egress) — just the soft-hidden rows for the "Show archived" view.
+  async listArchivedBatchJobs(): Promise<BatchJobSummary[]> {
+    return db
+      .select({
+        id: batchJobs.id,
+        batchId: batchJobs.batchId,
+        status: batchJobs.status,
+        fileName: batchJobs.fileName,
+        rowCount: batchJobs.rowCount,
+        submissionId: batchJobs.submissionId,
+        createdAt: batchJobs.createdAt,
+        archived: batchJobs.archived,
+      })
+      .from(batchJobs)
+      .where(eq(batchJobs.archived, true))
+      .orderBy(desc(batchJobs.createdAt))
+      .limit(100);
+  }
+
+  async setBatchJobArchived(id: string, archived: boolean): Promise<void> {
+    await db.update(batchJobs).set({ archived }).where(eq(batchJobs.id, id));
   }
 
   async getBatchJob(id: string): Promise<BatchJob | undefined> {

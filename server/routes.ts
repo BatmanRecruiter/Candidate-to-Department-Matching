@@ -265,6 +265,17 @@ export async function registerRoutes(
     }
   });
 
+  // Registered BEFORE /:id so the literal segment isn't captured as a job id.
+  // Summary projection only — same egress discipline as the live list.
+  app.get("/api/batch-jobs/archived", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      res.json(await storage.listArchivedBatchJobs());
+    } catch (err) {
+      next(err);
+    }
+  });
+
   app.get("/api/batch-jobs/:id", async (req, res, next) => {
     try {
       if (!requireAdmin(req, res)) return;
@@ -315,6 +326,20 @@ export async function registerRoutes(
       const existing = await storage.getBatchJob(req.params.id);
       if (!existing) return res.status(404).json({ message: "Batch job not found" });
       await storage.updateBatchJob(req.params.id, { status: parsed.status });
+      res.json({ ok: true });
+    } catch (err) {
+      next(err);
+    }
+  });
+
+  // Restore one soft-hidden job. Deliberately its own route (not a widened
+  // PATCH) so clients can never write `archived` arbitrarily.
+  app.post("/api/batch-jobs/:id/unarchive", async (req, res, next) => {
+    try {
+      if (!requireAdmin(req, res)) return;
+      const existing = await storage.getBatchJob(req.params.id);
+      if (!existing) return res.status(404).json({ message: "Batch job not found" });
+      await storage.setBatchJobArchived(req.params.id, false);
       res.json({ ok: true });
     } catch (err) {
       next(err);

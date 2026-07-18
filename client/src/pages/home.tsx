@@ -284,6 +284,8 @@ export default function Home() {
   const [clearingBatchJobs, setClearingBatchJobs] = useState(false);
   const [markingOrphan, setMarkingOrphan] = useState<string | null>(null);
   const [runExport, setRunExport] = useState<{ current: number; total: number } | null>(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
 
   const saveBatchJobs = useCallback(
     (update: StoredBatchJob[] | ((prev: StoredBatchJob[]) => StoredBatchJob[])) => {
@@ -329,6 +331,41 @@ export default function Home() {
         })),
     );
   }, [batchJobsQ.data]);
+
+  // Archived (soft-hidden) jobs — fetched lazily, only while the section is
+  // expanded. Summary rows only; view + restore, nothing else.
+  const archivedQ = useQuery<BatchJobSummary[]>({
+    queryKey: ["/api/batch-jobs/archived", adminPasscode.trim()],
+    queryFn: async () => {
+      const res = await apiRequest("GET", "/api/batch-jobs/archived", undefined, {
+        "x-admin-passcode": adminPasscode.trim(),
+      });
+      return res.json();
+    },
+    enabled: !!adminPasscode.trim() && showArchived,
+    refetchOnWindowFocus: false,
+  });
+
+  const restoreBatchJob = useCallback(
+    async (id: string) => {
+      const passcode = adminPasscode.trim();
+      if (!passcode) return;
+      setRestoringId(id);
+      try {
+        await apiRequest("POST", `/api/batch-jobs/${id}/unarchive`, undefined, {
+          "x-admin-passcode": passcode,
+        });
+        // Both lists change: the row leaves archived and rejoins the live list.
+        queryClient.invalidateQueries({ queryKey: ["/api/batch-jobs/archived", passcode] });
+        queryClient.invalidateQueries({ queryKey: ["/api/batch-jobs", passcode] });
+      } catch {
+        toast({ title: "Couldn't restore", description: "Try again.", variant: "destructive" });
+      } finally {
+        setRestoringId(null);
+      }
+    },
+    [adminPasscode, toast],
+  );
 
   // One-time cleanup of the retired localStorage cache.
   useEffect(() => {
@@ -1613,6 +1650,53 @@ export default function Home() {
                     ))}
                   </div>
                   )}
+                  <div className="pt-0.5">
+                    <button
+                      type="button"
+                      className="text-[10px] text-muted-foreground hover:text-foreground"
+                      onClick={() => setShowArchived((v) => !v)}
+                    >
+                      {showArchived ? "Hide archived" : "Show archived"}
+                      {archivedQ.data ? ` (${archivedQ.data.length})` : ""}
+                    </button>
+                    {showArchived &&
+                      (archivedQ.isLoading ? (
+                        <p className="mt-1 text-[11px] text-muted-foreground font-mono">
+                          Loading archived jobs…
+                        </p>
+                      ) : (archivedQ.data ?? []).length === 0 ? (
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          No archived jobs.
+                        </p>
+                      ) : (
+                        <div className="mt-1 max-h-60 overflow-y-auto space-y-1 pr-0.5">
+                          {(archivedQ.data ?? []).map((j) => (
+                            <div
+                              key={j.id}
+                              className="flex items-center justify-between gap-2 rounded border border-border/40 bg-background/50 p-1.5 opacity-70"
+                            >
+                              <div className="min-w-0">
+                                <p className="text-[11px] truncate" title={j.fileName}>
+                                  {j.fileName}
+                                </p>
+                                <p className="text-[10px] text-muted-foreground">
+                                  {j.rowCount} rows · {new Date(j.createdAt).toLocaleString()} · {j.status}
+                                </p>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="h-6 shrink-0 px-2 text-[10px]"
+                                onClick={() => restoreBatchJob(j.id)}
+                                disabled={restoringId === j.id}
+                              >
+                                {restoringId === j.id ? "Restoring…" : "Restore"}
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
+                      ))}
+                  </div>
                 </div>
               )}
               {adminPasscode.trim() && savedFilesQ.isLoading && (
