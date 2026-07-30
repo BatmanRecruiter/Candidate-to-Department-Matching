@@ -1033,29 +1033,36 @@ export default function Home() {
         // Send candidates to the server-side LLM matcher in parallel batches.
         let completed = 0;
         const CONCURRENCY = 5;
-        for (let i = 0; i < rows.length; i += CONCURRENCY) {
+        const matchOneRow = async (r: (typeof rows)[number], idx: number) => {
+          const matchRes = await apiRequest(
+            "POST",
+            "/api/match",
+            { row: filterRowForMatching(r).row },
+            undefined,
+            runAbort.signal,
+          );
+          const baseMatch = (await matchRes.json()) as MatchResult;
+          const m = applyCalibrationResponse(
+            baseMatch,
+            calibrationMap.get(candidateKeyForRow(r)),
+          );
+          results[idx] = m;
+          exportRows[idx] = buildExportRow(r, m, headers);
+          completed++;
+          setProgress(Math.round((completed / rows.length) * 100));
+        };
+        // Warm the prompt cache: run the first row alone so its response writes
+        // the shared system-prefix cache entry; the fan-out below then reads it
+        // at 0.1x instead of five cold requests each writing a 2x-cost entry.
+        if (rows.length > 0) {
+          if (stopRequestedRef.current) throw new Error("__run_stopped__");
+          await matchOneRow(rows[0], 0);
+        }
+        for (let i = 1; i < rows.length; i += CONCURRENCY) {
           if (stopRequestedRef.current) throw new Error("__run_stopped__");
           const chunk = rows.slice(i, Math.min(i + CONCURRENCY, rows.length));
           await Promise.all(
-            chunk.map(async (r, offset) => {
-              const idx = i + offset;
-              const matchRes = await apiRequest(
-                "POST",
-                "/api/match",
-                { row: filterRowForMatching(r).row },
-                undefined,
-                runAbort.signal,
-              );
-              const baseMatch = (await matchRes.json()) as MatchResult;
-              const m = applyCalibrationResponse(
-                baseMatch,
-                calibrationMap.get(candidateKeyForRow(r)),
-              );
-              results[idx] = m;
-              exportRows[idx] = buildExportRow(r, m, headers);
-              completed++;
-              setProgress(Math.round((completed / rows.length) * 100));
-            }),
+            chunk.map((r, offset) => matchOneRow(r, i + offset)),
           );
         }
 
