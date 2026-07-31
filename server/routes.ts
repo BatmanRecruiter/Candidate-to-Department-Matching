@@ -476,7 +476,9 @@ export async function registerRoutes(
   const EST_OUTPUT_TOKENS_PER_ROW = 250; // max_tokens is 512; rationales run ~150-300
   const MAX_BATCH_ROWS = 1100; // cost/memory bound. The per-row prompt-duplication OOM
   // that justified the old 500 cap is fixed (systemBlocks is built once and shared by
-  // reference below); this ceiling caps worst-case batch spend (no cache on this path).
+  // reference below); this ceiling caps worst-case batch spend. The batch path IS
+  // cached (1h cache_control on the last system block, matcher-llm.ts:307), but the
+  // ceiling assumes zero cache hits: they are best-effort, never guaranteed.
   const estimateTokens = (chars: number) => Math.ceil(chars / 3);
 
   // Accepts parsed candidate rows, submits them to the Anthropic Batch API
@@ -548,8 +550,11 @@ export async function registerRoutes(
         });
       }
 
-      // Cost estimate: hard-blocked rows are free; every other row pays the
-      // full system prompt (no caching on the batch path) plus its own text.
+      // Cost estimate: hard-blocked rows are free; every other row is priced at the
+      // full system prompt plus its own text. The batch path IS cached (1h TTL on
+      // the last system block since 1ef7daf, measured ~93% read hits), but hits are
+      // best-effort, so the guard deliberately assumes zero cache hits — it may
+      // overestimate, never underestimate.
       const llmRows = batchRequests.length;
       let systemTokens: number;
       try {
