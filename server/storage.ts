@@ -2,6 +2,7 @@ import { batchJobs, calibrations, correctionRules, savedFiles, syncedRoles, sync
 import type {
   BatchJob,
   BatchJobSummary,
+  BatchUsageStats,
   Calibration,
   CalibrationSummary,
   CorrectionRules,
@@ -37,7 +38,11 @@ export interface IStorage {
     id: string,
     patch: Partial<Pick<BatchJob, "batchId" | "status">>,
   ): Promise<void>;
-  storeBatchResults(batchId: string, resultsJson: string): Promise<{ wrote: boolean }>;
+  storeBatchResults(
+    batchId: string,
+    resultsJson: string,
+    usageStats?: BatchUsageStats,
+  ): Promise<{ wrote: boolean }>;
   archiveAllBatchJobs(): Promise<void>;
   listCalibrations(): Promise<CalibrationSummary[]>;
   listCorrections(): Promise<CalibrationSummary[]>;
@@ -182,10 +187,11 @@ export class DatabaseStorage implements IStorage {
   async storeBatchResults(
     batchId: string,
     resultsJson: string,
+    usageStats?: BatchUsageStats,
   ): Promise<{ wrote: boolean }> {
     const updated = await db
       .update(batchJobs)
-      .set({ results: resultsJson })
+      .set({ results: resultsJson, usageStats: usageStats ?? null })
       .where(and(eq(batchJobs.batchId, batchId), isNull(batchJobs.results)))
       .returning({ id: batchJobs.id });
     return { wrote: updated.length > 0 };

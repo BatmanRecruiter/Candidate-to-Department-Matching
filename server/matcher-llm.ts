@@ -239,6 +239,7 @@ export function processMatchContent(
       best_dept_score: 0,
       candidate_yoe: null,
       candidate_region: "",
+      parse_failed: true,
     };
   }
 
@@ -256,6 +257,7 @@ export function processMatchContent(
       best_dept_score: 0,
       candidate_yoe: null,
       candidate_region: "",
+      parse_failed: true,
     };
   }
 

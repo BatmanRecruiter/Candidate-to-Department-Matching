@@ -44,6 +44,10 @@ export interface MatchResult {
   best_dept_score: number;
   candidate_yoe: number | null;
   candidate_region: string;
+  /** true = department became HUMAN_REVIEW because the LLM response failed to
+   * parse (pipeline failure), NOT because the model judged it needs review.
+   * Absent on genuine verdicts and on all rows stored before this field. */
+  parse_failed?: boolean;
 }
 
 export const UNSURE = "Unsure / Not Enough Information";

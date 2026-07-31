@@ -1,4 +1,4 @@
-import { pgTable, text, integer, bigint, boolean } from "drizzle-orm/pg-core";
+import { pgTable, text, integer, bigint, boolean, jsonb } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 
@@ -99,6 +99,20 @@ export const calibrations = pgTable("calibrations", {
 // BEFORE the Anthropic create() call (intent-log-before-side-effect), then
 // updated with the real batch_id. csvText/preResolved are the large fields and
 // are excluded from list queries (see BatchJobSummary) to avoid egress cost.
+// Per-batch usage rollup captured from Anthropic result items at poll time.
+// null = batch completed before instrumentation. Written once alongside
+// results under the same write-once-while-null gate.
+export type BatchUsageStats = {
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  rows_with_cache_read: number;
+  rows_with_cache_creation: number;
+  stop_reasons: Record<string, number>; // e.g. { end_turn: 340, max_tokens: 9 }
+  max_tokens_rows: number[]; // row indexes that hit max_tokens, capped at 50
+};
+
 export const batchJobs = pgTable("batch_jobs", {
   id: text("id").primaryKey(),
   batchId: text("batch_id"), // Anthropic batch id; NULL until create() returns (or for all-hard-blocked jobs)
@@ -108,6 +122,7 @@ export const batchJobs = pgTable("batch_jobs", {
   csvText: text("csv_text").notNull(), // full original CSV — rebuilds exports; NEVER selected in list queries
   preResolved: text("pre_resolved").notNull(), // JSON-encoded Record<number, MatchResult> of hard-blocked rows
   results: text("results"), // JSON-encoded Record<number, MatchResult> from Anthropic; null = not stored yet (download falls back to the Anthropic retrieve)
+  usageStats: jsonb("usage_stats").$type<BatchUsageStats>(), // per-batch usage rollup; null = pre-instrumentation
   submissionId: text("submission_id"), // shared by every job in one drop ("this run"); null on rows predating the column
   createdAt: bigint("created_at", { mode: "number" }).notNull(),
   archived: boolean("archived").notNull().default(false), // soft-hide for "Clear all"; never hard-deleted, so the durable billing record survives
@@ -166,7 +181,7 @@ export const batchJobPatchSchema = z.object({
 });
 export type BatchJobRequest = z.infer<typeof batchJobRequestSchema>;
 export type BatchJob = typeof batchJobs.$inferSelect;
-export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved" | "results">;
+export type BatchJobSummary = Omit<BatchJob, "csvText" | "preResolved" | "results" | "usageStats">;
 
 // Re-export matcher / template types for client + server use.
 export type { RoleLibraryJob, MatchResult } from "./matcher";

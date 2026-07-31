@@ -90,7 +90,8 @@ export async function cachedMessage({
   console.log(
     `[cache] wrote ${u.cache_creation_input_tokens ?? 0} | ` +
       `read ${u.cache_read_input_tokens ?? 0} | ` +
-      `fresh input ${u.input_tokens ?? 0}`
+      `fresh input ${u.input_tokens ?? 0} | ` +
+      `stop ${response.stop_reason ?? "?"}`
   );
 
   return response;

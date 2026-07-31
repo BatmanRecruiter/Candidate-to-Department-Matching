@@ -2,7 +2,7 @@ import type { Express } from "express";
 import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
-import { batchJobPatchSchema, batchJobRequestSchema, calibrationRequestSchema, saveFileRequestSchema } from "@shared/schema";
+import { batchJobPatchSchema, batchJobRequestSchema, calibrationRequestSchema, saveFileRequestSchema, type BatchUsageStats } from "@shared/schema";
 import { storage } from "./storage";
 import { runRoleSync } from "./role-sync";
 import {
@@ -686,15 +686,54 @@ export async function registerRoutes(
       }
 
       const results: Record<number, unknown> = {};
+      // Per-batch usage rollup, persisted once with the results. stop_reasons
+      // exists to answer "did any row hit max_tokens" without re-fetching.
+      const MAX_TOKENS_ROWS_CAP = 50;
+      const usageStats: BatchUsageStats = {
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        rows_with_cache_read: 0,
+        rows_with_cache_creation: 0,
+        stop_reasons: {},
+        max_tokens_rows: [],
+      };
       for await (const item of await batchClient.messages.batches.results(
         req.params.id,
       )) {
         const idx = parseInt((item.custom_id as string).replace("candidate-", ""), 10);
         if ((item.result as { type: string }).type === "succeeded") {
-          const msg = (item.result as { type: "succeeded"; message: { content: unknown[] } }).message;
+          const msg = (
+            item.result as {
+              type: "succeeded";
+              message: {
+                content: unknown[];
+                stop_reason: string | null;
+                usage?: {
+                  input_tokens?: number;
+                  output_tokens?: number;
+                  cache_creation_input_tokens?: number | null;
+                  cache_read_input_tokens?: number | null;
+                };
+              };
+            }
+          ).message;
           results[idx] = processMatchContent(
             msg.content as Array<{ type: string; text?: string }>,
           );
+          const u = msg.usage;
+          usageStats.input_tokens += u?.input_tokens ?? 0;
+          usageStats.output_tokens += u?.output_tokens ?? 0;
+          usageStats.cache_creation_input_tokens += u?.cache_creation_input_tokens ?? 0;
+          usageStats.cache_read_input_tokens += u?.cache_read_input_tokens ?? 0;
+          if ((u?.cache_read_input_tokens ?? 0) > 0) usageStats.rows_with_cache_read++;
+          if ((u?.cache_creation_input_tokens ?? 0) > 0) usageStats.rows_with_cache_creation++;
+          const stop = msg.stop_reason ?? "unknown";
+          usageStats.stop_reasons[stop] = (usageStats.stop_reasons[stop] ?? 0) + 1;
+          if (stop === "max_tokens" && usageStats.max_tokens_rows.length < MAX_TOKENS_ROWS_CAP) {
+            usageStats.max_tokens_rows.push(idx);
+          }
         } else {
           const { HUMAN_REVIEW } = await import("@shared/matcher");
           results[idx] = {
@@ -718,7 +757,11 @@ export async function registerRoutes(
       let firstCompletion = false;
       try {
         firstCompletion = (
-          await storage.storeBatchResults(req.params.id, JSON.stringify(results))
+          await storage.storeBatchResults(
+            req.params.id,
+            JSON.stringify(results),
+            usageStats,
+          )
         ).wrote;
       } catch (persistErr) {
         console.error(`[batch] persisting results failed id=${req.params.id}:`, persistErr);
