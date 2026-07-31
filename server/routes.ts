@@ -781,13 +781,29 @@ export async function registerRoutes(
       if (firstCompletion) {
         // Fire-and-forget Slack notification, first completion only.
         const fileName = typeof req.query.fileName === "string" ? req.query.fileName : "batch job";
-        const counts = batch.request_counts as { succeeded: number; errored: number };
+        const counts = batch.request_counts as {
+          succeeded: number;
+          errored: number;
+          canceled: number;
+        };
+        // A canceled batch still reaches "ended" and stores its billed partial
+        // results — announce it as canceled, never as complete. NOTE: this fires
+        // only when the GET runs on an ended batch, which for a canceled batch
+        // happens only via a race (poll in flight at cancel time, failed status
+        // PATCH, or a stale client on another machine) — normal cancellations
+        // produce NO Slack message at all. That is intended.
         sendSlackNotification(
-          `*phData Matcher — Batch Complete* ✓\n` +
-          `File: ${fileName}\n` +
-          `${counts.succeeded} candidates scored` +
-          (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
-          `\nResults have been auto-loaded in the app.`,
+          counts.canceled > 0
+            ? `*phData Matcher — Batch Canceled* ■\n` +
+              `File: ${fileName}\n` +
+              `${counts.succeeded} candidates scored before cancellation, ${counts.canceled} canceled` +
+              (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
+              `\nScored rows were billed and their results are stored.`
+            : `*phData Matcher — Batch Complete* ✓\n` +
+              `File: ${fileName}\n` +
+              `${counts.succeeded} candidates scored` +
+              (counts.errored > 0 ? `, ${counts.errored} errors` : "") +
+              `\nResults have been auto-loaded in the app.`,
         ).catch((err) => console.warn("[slack] batch notification failed:", err));
       }
     } catch (err) {
