@@ -323,7 +323,7 @@ export function buildMatchParams(
   const candidateText = buildCandidateText(row);
   return {
     model: MODEL,
-    max_tokens: 512,
+    max_tokens: 900,
     system: systemBlocks,
     thinking: { type: "disabled" },
     messages: [
@@ -359,7 +359,7 @@ export async function matchCandidateLLM(
       },
     ],
     model: MODEL,
-    maxTokens: 512,
+    maxTokens: 900,
     thinking: { type: "disabled" },
   });
 
